@@ -1,0 +1,72 @@
+import boto3
+from datetime import datetime, timedelta
+
+def lambda_handler(event, context):
+    # Set thresholds for CPU usage and network traffic in bytes
+    cpu_threshold = 1
+    network_in_threshold_bytes = 10000  # 1 kb
+    network_out_threshold_bytes = 15000  # 1.5 kb
+    consecutive_days_threshold = 3
+
+    # Create an EC2 resource
+    ec2_resource = boto3.resource('ec2')
+
+    # Get all running instances
+    instances = ec2_resource.instances.filter(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+
+    # Loop through instances
+    for instance in instances:
+        instance_id = instance.id
+        instance_type = instance.instance_type
+        launch_time = instance.launch_time
+
+        # Calculate the number of days the instance has been running
+        running_days = (datetime.utcnow() - launch_time.replace(tzinfo=None)).days
+
+        # Check if the instance has been running for more than the consecutive days threshold
+        if running_days >= consecutive_days_threshold:
+            stop_instance = True  # Flag to determine if the instance should be stopped
+
+            for i in range(consecutive_days_threshold):
+                start_time = datetime.utcnow() - timedelta(days=i+1)
+                end_time = datetime.utcnow() - timedelta(days=i)
+
+                # Get network in and network out metrics for the instance
+                network_in = get_network_metric(instance_id, 'NetworkIn', start_time, end_time)
+                network_out = get_network_metric(instance_id, 'NetworkOut', start_time, end_time)
+
+                # Check if the instance meets the threshold criteria for the current day
+                if network_in >= network_in_threshold_bytes or network_out >= network_out_threshold_bytes:
+                    stop_instance = False  # Instance does not meet the threshold for this day, skip to the next day
+                    break
+
+            if stop_instance:
+                print(f"Instance {instance_id} ({instance_type}) meets the threshold for all consecutive days. Stopping instance...")
+                # Add code to stop the instance here
+            else:
+                print(f"Instance {instance_id} ({instance_type}) does not meet the threshold for all consecutive days. Skipping instance...")
+
+        else:
+            print(f"Instance {instance_id} ({instance_type}) has not been running for the consecutive days threshold.")
+
+    print("Lambda execution completed.")
+
+def get_network_metric(instance_id, metric_name, start_time, end_time):
+    cw = boto3.client('cloudwatch')
+
+    response = cw.get_metric_statistics(
+        Namespace='AWS/EC2',
+        MetricName=metric_name,
+        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=86400,  # 1 day period
+        Statistics=['Average']
+    )
+
+    # Extract the average value from the response
+    datapoints = response['Datapoints']
+    if datapoints:
+        return datapoints[0]['Average']
+
+    return 0  # Return 0 if no data points are available
