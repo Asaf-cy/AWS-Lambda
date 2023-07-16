@@ -6,13 +6,16 @@ def lambda_handler(event, context):
     cpu_threshold = 0.5
     network_in_threshold_bytes = 2500  # 2.5 kb
     network_out_threshold_bytes = 3000  # 3 kb
-    consecutive_days_threshold = 6
+    consecutive_days_threshold = 7
 
     # Create an EC2 resource
     ec2_resource = boto3.resource('ec2')
 
     # Get all running instances
     instances = ec2_resource.instances.filter(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
+
+    # Initialize a dictionary to store the count of stopped instances by instance type
+    stopped_instances_by_type = {}
 
     # Loop through instances
     for instance in instances:
@@ -43,11 +46,20 @@ def lambda_handler(event, context):
             if stop_instance:
                 print(f"Instance {instance_id} ({instance_type}) meets the threshold for all consecutive days. Stopping instance...")
                 # Add code to stop the instance here
+
+                # Update the count of stopped instances by instance type
+                stopped_instances_by_type[instance_type] = stopped_instances_by_type.get(instance_type, 0) + 1
+
             else:
                 print(f"Instance {instance_id} ({instance_type}) does not meet the threshold for all consecutive days. Skipping instance...")
 
         else:
             print(f"Instance {instance_id} ({instance_type}) has not been running for the consecutive days threshold.")
+
+    # Print the summary of stopped instances by instance type
+    print("Summary of stopped instances:")
+    for instance_type, count in stopped_instances_by_type.items():
+        print(f"{instance_type}: {count} instances stopped.")
 
     print("Lambda execution completed.")
 
