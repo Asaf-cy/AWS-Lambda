@@ -4,9 +4,9 @@ from datetime import datetime, timedelta
 def lambda_handler(event, context):
     # Set thresholds for CPU usage and network traffic in bytes
     cpu_threshold = 0.5
-    network_in_threshold_bytes = 1000  # 1 kb
-    network_out_threshold_bytes = 1500  # 1.5 kb
-    consecutive_days_threshold = 3
+    network_in_threshold_bytes = 2500  # 2.5 kb
+    network_out_threshold_bytes = 3000  # 3 kb
+    consecutive_days_threshold = 6
 
     # Create an EC2 resource
     ec2_resource = boto3.resource('ec2')
