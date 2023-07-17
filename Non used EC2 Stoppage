@@ -7,65 +7,82 @@ def lambda_handler(event, context):
     network_in_threshold_bytes = 2500  # 2.5 kb
     network_out_threshold_bytes = 3000  # 3 kb
     consecutive_days_threshold = 7
+    
+    # Get a list of all AWS regions
+    ec2_client = boto3.client('ec2')
+    regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
 
-    # Create an EC2 resource
-    ec2_resource = boto3.resource('ec2')
-
-    # Get all running instances
-    instances = ec2_resource.instances.filter(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
-
-    # Initialize a dictionary to store the count of stopped instances by instance type
+    # Initialize dictionaries to store the count and cost of stopped instances by instance type in each region
     stopped_instances_by_type = {}
+    stopped_instances_cost_by_type = {}
 
-    # Loop through instances
-    for instance in instances:
-        instance_id = instance.id
-        instance_type = instance.instance_type
-        launch_time = instance.launch_time
+    # Loop through each region
+    for region in regions:
+        print(f"Processing instances in region: {region}")
 
-        # Calculate the number of days the instance has been running
-        running_days = (datetime.utcnow() - launch_time.replace(tzinfo=None)).days
+        # Create EC2 and CloudWatch clients for the region
+        ec2_resource = boto3.resource('ec2', region_name=region)
+        cw = boto3.client('cloudwatch', region_name=region)
 
-        # Check if the instance has been running for more than the consecutive days threshold
-        if running_days >= consecutive_days_threshold:
-            stop_instance = True  # Flag to determine if the instance should be stopped
+        # Get all running instances in the region
+        instances = ec2_resource.instances.filter(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}])
 
-            for i in range(consecutive_days_threshold):
-                start_time = datetime.utcnow() - timedelta(days=i+1)
-                end_time = datetime.utcnow() - timedelta(days=i)
+        # Loop through instances in the region
+        for instance in instances:
+            instance_id = instance.id
+            instance_type = instance.instance_type
+            launch_time = instance.launch_time
 
-                # Get network in and network out metrics for the instance
-                network_in = get_network_metric(instance_id, 'NetworkIn', start_time, end_time)
-                network_out = get_network_metric(instance_id, 'NetworkOut', start_time, end_time)
+            # Calculate the number of days the instance has been running
+            running_days = (datetime.utcnow() - launch_time.replace(tzinfo=None)).days
 
-                # Check if the instance meets the threshold criteria for the current day
-                if network_in >= network_in_threshold_bytes or network_out >= network_out_threshold_bytes:
-                    stop_instance = False  # Instance does not meet the threshold for this day, skip to the next day
-                    break
+            # Check if the instance has been running for more than the consecutive days threshold
+            if running_days >= consecutive_days_threshold:
+                stop_instance = True  # Flag to determine if the instance should be stopped
 
-            if stop_instance:
-                print(f"Instance {instance_id} ({instance_type}) meets the threshold for all consecutive days. Stopping instance...")
-                # Add code to stop the instance here
+                for i in range(consecutive_days_threshold):
+                    start_time = datetime.utcnow() - timedelta(days=i + 1)
+                    end_time = datetime.utcnow() - timedelta(days=i)
 
-                # Update the count of stopped instances by instance type
-                stopped_instances_by_type[instance_type] = stopped_instances_by_type.get(instance_type, 0) + 1
+                    # Get network in and network out metrics for the instance
+                    network_in = get_network_metric(instance_id, 'NetworkIn', start_time, end_time, cw)
+                    network_out = get_network_metric(instance_id, 'NetworkOut', start_time, end_time, cw)
+
+                    # Check if the instance meets the threshold criteria for the current day
+                    if network_in >= network_in_threshold_bytes or network_out >= network_out_threshold_bytes:
+                        stop_instance = False  # Instance does not meet the threshold for this day, skip to the next day
+                        break
+
+                if stop_instance:
+                    print(f"Instance {instance_id} ({instance_type}) in region {region} meets the threshold for all consecutive days. Stopping instance...")
+                    # Add code to stop the instance here
+
+                    # Update the count of stopped instances by instance type in the region
+                    stopped_instances_by_type[region] = stopped_instances_by_type.get(region, {})
+                    stopped_instances_by_type[region][instance_type] = stopped_instances_by_type[region].get(instance_type, 0) + 1
+
+                    # Calculate the cost of the stopped instance
+                    instance_cost = calculate_instance_cost(instance_type, consecutive_days_threshold)
+                    stopped_instances_cost_by_type[region] = stopped_instances_cost_by_type.get(region, {})
+                    stopped_instances_cost_by_type[region][instance_type] = stopped_instances_cost_by_type[region].get(instance_type, 0) + instance_cost
+
+                else:
+                    print(f"Instance {instance_id} ({instance_type}) in region {region} does not meet the threshold for all consecutive days. Skipping instance...")
 
             else:
-                print(f"Instance {instance_id} ({instance_type}) does not meet the threshold for all consecutive days. Skipping instance...")
+                print(f"Instance {instance_id} ({instance_type}) in region {region} has not been running for the consecutive days threshold.")
 
-        else:
-            print(f"Instance {instance_id} ({instance_type}) has not been running for the consecutive days threshold.")
-
-    # Print the summary of stopped instances by instance type
+    # Print the summary of stopped instances by instance type in each region
     print("Summary of stopped instances:")
-    for instance_type, count in stopped_instances_by_type.items():
-        print(f"{instance_type}: {count} instances stopped.")
+    for region, instances_by_type in stopped_instances_by_type.items():
+        print(f"Region: {region}")
+        for instance_type, count in instances_by_type.items():
+            cost = stopped_instances_cost_by_type[region][instance_type]
+            print(f"{instance_type}: {count} instances stopped, Cost: ${cost}")
 
     print("Lambda execution completed.")
 
-def get_network_metric(instance_id, metric_name, start_time, end_time):
-    cw = boto3.client('cloudwatch')
-
+def get_network_metric(instance_id, metric_name, start_time, end_time, cw):
     response = cw.get_metric_statistics(
         Namespace='AWS/EC2',
         MetricName=metric_name,
@@ -82,3 +99,37 @@ def get_network_metric(instance_id, metric_name, start_time, end_time):
         return datapoints[0]['Average']
 
     return 0  # Return 0 if no data points are available
+
+def calculate_instance_cost(instance_type, consecutive_days_threshold):
+    # Create a Cost Explorer client
+    cost_explorer = boto3.client('ce')
+
+    # Set the start and end dates for the cost calculation
+    start_date = (datetime.utcnow() - timedelta(days=consecutive_days_threshold)).strftime('%Y-%m-%d')
+    end_date = datetime.utcnow().strftime('%Y-%m-%d')
+
+    # Query the Cost Explorer API to get the total cost for the instance type in the specified period
+    response = cost_explorer.get_cost_and_usage(
+        TimePeriod={
+            'Start': start_date,
+            'End': end_date
+        },
+        Granularity='DAILY',
+        Metrics=[
+            'BlendedCost',
+        ],
+        Filter={
+            'Dimensions': {
+                'Key': 'INSTANCE_TYPE',
+                'Values': [instance_type]
+            }
+        }
+    )
+
+    # Extract the total cost from the response
+    results_by_time = response['ResultsByTime']
+    total_cost = 0
+    for result in results_by_time:
+        total_cost += float(result['Total']['BlendedCost']['Amount'])
+
+    return total_cost
