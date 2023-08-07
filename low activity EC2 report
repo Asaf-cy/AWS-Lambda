@@ -7,33 +7,6 @@ def get_instance_name(instance):
             return tag['Value']
     return 'N/A'
 
-def get_instance_cost(instance_type, region):
-    client = boto3.client('ce', region_name=region)
-    
-    yesterday = (datetime.now() - timedelta(days=1)).date()
-    start_date = (yesterday - timedelta(days=30)).strftime('%Y-%m-%d')
-    end_date = yesterday.strftime('%Y-%m-%d')
-    
-    response = client.get_cost_and_usage(
-        TimePeriod= {
-            'Start': start_date,
-            'End': end_date
-        },
-        Granularity='DAILY',
-        GroupBy=[{'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}],
-        Metrics=['UnblendedCost']
-    )
-    
-    for result in response['ResultsByTime']:
-        for group in result['Groups']:
-            usage_type = group['Keys'][0]
-            if f'BoxUsage:{instance_type}' in usage_type:
-                cost = float(group['Metrics']['UnblendedCost']['Amount'])
-                return cost
-    
-    return None
-
-
 def lambda_handler(event, context):
     regions = ['us-east-1', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-central-1']  # Add more regions as needed
 
@@ -67,45 +40,43 @@ def lambda_handler(event, context):
                     Statistics=['Average']
                 )
                 
-                if len(cpu_metric['Datapoints']) > 0 and cpu_metric['Datapoints'][0]['Average'] < 1:
-                    # Get NetworkIn metric (average across 30 days)
-                    network_in_metric = cw.get_metric_statistics(
-                        Namespace='AWS/EC2',
-                        MetricName='NetworkIn',
-                        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                        StartTime=datetime.now() - timedelta(days=30),
-                        EndTime=datetime.now(),
-                        Period=86400,
-                        Statistics=['Average']
-                    )
-                    
-                    # Get NetworkOut metric (average across 30 days)
-                    network_out_metric = cw.get_metric_statistics(
-                        Namespace='AWS/EC2',
-                        MetricName='NetworkOut',
-                        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                        StartTime=datetime.now() - timedelta(days=30),
-                        EndTime=datetime.now(),
-                        Period=86400,
-                        Statistics=['Average']
-                    )
-                    
-                    # Calculate instance cost
-                    instance_cost = get_instance_cost(instance_type, region)
-                    if instance_cost is not None:
-                        daily_cost = instance_cost
-                    else:
-                        daily_cost = 'N/A'
+                # Get NetworkIn metric (average across 30 days)
+                network_in_metric = cw.get_metric_statistics(
+                    Namespace='AWS/EC2',
+                    MetricName='NetworkIn',
+                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                    StartTime=datetime.now() - timedelta(days=30),
+                    EndTime=datetime.now(),
+                    Period=86400,
+                    Statistics=['Average']
+                )
+                
+                # Get NetworkOut metric (average across 30 days)
+                network_out_metric = cw.get_metric_statistics(
+                    Namespace='AWS/EC2',
+                    MetricName='NetworkOut',
+                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                    StartTime=datetime.now() - timedelta(days=30),
+                    EndTime=datetime.now(),
+                    Period=86400,
+                    Statistics=['Average']
+                )
+                
+                if (cpu_metric['Datapoints'] and
+                    cpu_metric['Datapoints'][0]['Average'] < 1 and
+                    network_in_metric['Datapoints'] and
+                    network_out_metric['Datapoints'] and
+                    network_in_metric['Datapoints'][0]['Average'] < 130000 and
+                    network_out_metric['Datapoints'][0]['Average'] < 150000):
                     
                     low_activity_instances.append({
                         'Region': region,
-                        'InstanceId': instance_id,
                         'InstanceName': instance_name,
+                        'InstanceId': instance_id,
                         'InstanceType': instance_type,
                         'Average CPU Utilization': cpu_metric['Datapoints'][0]['Average'],
                         'Average Network In': network_in_metric['Datapoints'][0]['Average'],
-                        'Average Network Out': network_out_metric['Datapoints'][0]['Average'],
-                        'Daily Cost': daily_cost
+                        'Average Network Out': network_out_metric['Datapoints'][0]['Average']
                     })
 
     # Print low activity instances
@@ -117,7 +88,6 @@ def lambda_handler(event, context):
         print(f"Average CPU Utilization: {instance['Average CPU Utilization']}%")
         print(f"Average Network In: {instance['Average Network In']} Bytes")
         print(f"Average Network Out: {instance['Average Network Out']} Bytes")
-        print(f"Daily Cost: ${instance['Daily Cost']}") if instance['Daily Cost'] != 'N/A' else print("Daily Cost: N/A")
         print("---")
 
     return {
