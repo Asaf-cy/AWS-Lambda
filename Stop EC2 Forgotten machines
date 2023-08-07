@@ -118,18 +118,23 @@ def get_network_metric(instance_id, metric_name, start_time, end_time):
 
 
 def calculate_instance_cost(instance_type, consecutive_days_threshold):
-    ce = boto3.client('ce')
+    # Create a Cost Explorer client
+    cost_explorer = boto3.client('ce')
 
+    # Set the start and end dates for the cost calculation
     start_date = (datetime.utcnow() - timedelta(days=consecutive_days_threshold)).strftime('%Y-%m-%d')
     end_date = datetime.utcnow().strftime('%Y-%m-%d')
 
-    response = ce.get_cost_and_usage(
+    # Query the Cost Explorer API to get the daily cost for the instance type in the specified period
+    response = cost_explorer.get_cost_and_usage(
         TimePeriod={
             'Start': start_date,
             'End': end_date
         },
         Granularity='DAILY',
-        Metrics=['UnblendedCost'],
+        Metrics=[
+            'UnblendedCost',
+        ],
         Filter={
             'Dimensions': {
                 'Key': 'INSTANCE_TYPE',
@@ -138,10 +143,14 @@ def calculate_instance_cost(instance_type, consecutive_days_threshold):
         }
     )
 
+    # Extract the daily cost from the response
     results_by_time = response['ResultsByTime']
-    total_cost = 0
+    total_daily_cost = 0
     for result in results_by_time:
-        total_cost += float(result['Total']['UnblendedCost']['Amount'])
+        total_daily_cost += float(result['Total']['UnblendedCost']['Amount'])
+
+    # Calculate the total cost by multiplying the daily cost by the consecutive days threshold
+    total_cost = total_daily_cost * consecutive_days_threshold
 
     return total_cost
 
