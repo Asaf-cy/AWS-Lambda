@@ -20,23 +20,18 @@ def get_instance_cost(instance_type, region):
             'End': end_date
         },
         Granularity='DAILY',
-        Filter={
-            'Dimensions': {
-                'Key': 'SERVICE',
-                'Values': ['Amazon Elastic Compute Cloud - Compute']
-            }
-        },
+        GroupBy=[{'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'}],
         Metrics=['UnblendedCost']
     )
     
     for result in response['ResultsByTime']:
-        cost = float(result['Total']['UnblendedCost']['Amount'])
-        return cost
+        for group in result['Groups']:
+            usage_type = group['Keys'][0]
+            if f'BoxUsage:{instance_type}' in usage_type:
+                cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                return cost
     
     return None
-
-
-
 
 
 def lambda_handler(event, context):
@@ -72,31 +67,28 @@ def lambda_handler(event, context):
                     Statistics=['Average']
                 )
                 
-                # Get NetworkIn metric (average across 30 days)
-                network_in_metric = cw.get_metric_statistics(
-                    Namespace='AWS/EC2',
-                    MetricName='NetworkIn',
-                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                    StartTime=datetime.now() - timedelta(days=30),
-                    EndTime=datetime.now(),
-                    Period=86400,
-                    Statistics=['Average']
-                )
-                
-                # Get NetworkOut metric (average across 30 days)
-                network_out_metric = cw.get_metric_statistics(
-                    Namespace='AWS/EC2',
-                    MetricName='NetworkOut',
-                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                    StartTime=datetime.now() - timedelta(days=30),
-                    EndTime=datetime.now(),
-                    Period=86400,
-                    Statistics=['Average']
-                )
-                
-                if (cpu_metric['Datapoints'][0]['Average'] < 1) and \
-                   (network_in_metric['Datapoints'][0]['Average'] < 130000) and \
-                   (network_out_metric['Datapoints'][0]['Average'] < 150000):
+                if len(cpu_metric['Datapoints']) > 0 and cpu_metric['Datapoints'][0]['Average'] < 1:
+                    # Get NetworkIn metric (average across 30 days)
+                    network_in_metric = cw.get_metric_statistics(
+                        Namespace='AWS/EC2',
+                        MetricName='NetworkIn',
+                        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                        StartTime=datetime.now() - timedelta(days=30),
+                        EndTime=datetime.now(),
+                        Period=86400,
+                        Statistics=['Average']
+                    )
+                    
+                    # Get NetworkOut metric (average across 30 days)
+                    network_out_metric = cw.get_metric_statistics(
+                        Namespace='AWS/EC2',
+                        MetricName='NetworkOut',
+                        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                        StartTime=datetime.now() - timedelta(days=30),
+                        EndTime=datetime.now(),
+                        Period=86400,
+                        Statistics=['Average']
+                    )
                     
                     # Calculate instance cost
                     instance_cost = get_instance_cost(instance_type, region)
