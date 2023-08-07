@@ -2,13 +2,14 @@ import boto3
 from datetime import datetime, timedelta
 import smtplib
 from email.mime.text import MIMEText
+import decimal
 
 def lambda_handler(event, context):
     # Set thresholds for CPU usage and network traffic in bytes
     cpu_threshold = 1
     network_in_threshold_bytes = 2500  # 1 kb
     network_out_threshold_bytes = 3000  # 1.5 kb
-    consecutive_days_threshold = 11
+    consecutive_days_threshold = 30
 
     # Create EC2 resource for stopping instances
     ec2_resource = boto3.resource('ec2')
