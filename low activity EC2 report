@@ -1,0 +1,134 @@
+import boto3
+from datetime import datetime, timedelta
+
+def get_instance_name(instance):
+    for tag in instance.get('Tags', []):
+        if tag['Key'] == 'Name':
+            return tag['Value']
+    return 'N/A'
+
+def get_instance_cost(instance_type, region):
+    client = boto3.client('ce', region_name=region)
+    
+    yesterday = (datetime.now() - timedelta(days=1)).date()
+    start_date = (yesterday - timedelta(days=30)).strftime('%Y-%m-%d')
+    end_date = yesterday.strftime('%Y-%m-%d')
+    
+    response = client.get_cost_and_usage(
+        TimePeriod= {
+            'Start': start_date,
+            'End': end_date
+        },
+        Granularity='DAILY',
+        Filter={
+            'Dimensions': {
+                'Key': 'SERVICE',
+                'Values': ['Amazon Elastic Compute Cloud - Compute']
+            }
+        },
+        Metrics=['UnblendedCost']
+    )
+    
+    for result in response['ResultsByTime']:
+        cost = float(result['Total']['UnblendedCost']['Amount'])
+        return cost
+    
+    return None
+
+
+
+
+
+def lambda_handler(event, context):
+    regions = ['us-east-1', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-central-1']  # Add more regions as needed
+
+    low_activity_instances = []
+
+    for region in regions:
+        ec2 = boto3.client('ec2', region_name=region)
+        cw = boto3.client('cloudwatch', region_name=region)
+        
+        # Get instances in the region
+        instances = ec2.describe_instances()
+        
+        for reservation in instances['Reservations']:
+            for instance in reservation['Instances']:
+                instance_id = instance['InstanceId']
+                
+                # Get instance name from 'Name' tag
+                instance_name = get_instance_name(instance)
+                
+                # Get instance type
+                instance_type = instance['InstanceType']
+                
+                # Get CPU utilization metric (average across 30 days)
+                cpu_metric = cw.get_metric_statistics(
+                    Namespace='AWS/EC2',
+                    MetricName='CPUUtilization',
+                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                    StartTime=datetime.now() - timedelta(days=30),
+                    EndTime=datetime.now(),
+                    Period=86400,
+                    Statistics=['Average']
+                )
+                
+                # Get NetworkIn metric (average across 30 days)
+                network_in_metric = cw.get_metric_statistics(
+                    Namespace='AWS/EC2',
+                    MetricName='NetworkIn',
+                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                    StartTime=datetime.now() - timedelta(days=30),
+                    EndTime=datetime.now(),
+                    Period=86400,
+                    Statistics=['Average']
+                )
+                
+                # Get NetworkOut metric (average across 30 days)
+                network_out_metric = cw.get_metric_statistics(
+                    Namespace='AWS/EC2',
+                    MetricName='NetworkOut',
+                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                    StartTime=datetime.now() - timedelta(days=30),
+                    EndTime=datetime.now(),
+                    Period=86400,
+                    Statistics=['Average']
+                )
+                
+                if (cpu_metric['Datapoints'][0]['Average'] < 1) and \
+                   (network_in_metric['Datapoints'][0]['Average'] < 130000) and \
+                   (network_out_metric['Datapoints'][0]['Average'] < 150000):
+                    
+                    # Calculate instance cost
+                    instance_cost = get_instance_cost(instance_type, region)
+                    if instance_cost is not None:
+                        daily_cost = instance_cost
+                    else:
+                        daily_cost = 'N/A'
+                    
+                    low_activity_instances.append({
+                        'Region': region,
+                        'InstanceId': instance_id,
+                        'InstanceName': instance_name,
+                        'InstanceType': instance_type,
+                        'Average CPU Utilization': cpu_metric['Datapoints'][0]['Average'],
+                        'Average Network In': network_in_metric['Datapoints'][0]['Average'],
+                        'Average Network Out': network_out_metric['Datapoints'][0]['Average'],
+                        'Daily Cost': daily_cost
+                    })
+
+    # Print low activity instances
+    for instance in low_activity_instances:
+        print(f"Low Activity EC2 Instance in {instance['Region']}:")
+        print(f"Instance Name: {instance['InstanceName']}")
+        print(f"Instance ID: {instance['InstanceId']}")
+        print(f"Instance Type: {instance['InstanceType']}")
+        print(f"Average CPU Utilization: {instance['Average CPU Utilization']}%")
+        print(f"Average Network In: {instance['Average Network In']} Bytes")
+        print(f"Average Network Out: {instance['Average Network Out']} Bytes")
+        print(f"Daily Cost: ${instance['Daily Cost']}") if instance['Daily Cost'] != 'N/A' else print("Daily Cost: N/A")
+        print("---")
+
+    return {
+        'statusCode': 200,
+        'body': 'Low activity instances identified and printed.'
+    }
