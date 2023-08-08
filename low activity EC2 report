@@ -66,8 +66,8 @@ def lambda_handler(event, context):
                     cpu_metric['Datapoints'][0]['Average'] < 1 and
                     network_in_metric['Datapoints'] and
                     network_out_metric['Datapoints'] and
-                    network_in_metric['Datapoints'][0]['Average'] < 130000 and
-                    network_out_metric['Datapoints'][0]['Average'] < 150000):
+                    network_in_metric['Datapoints'][0]['Average'] < 30000 and
+                    network_out_metric['Datapoints'][0]['Average'] < 40000):
                     
                     low_activity_instances.append({
                         'Region': region,
