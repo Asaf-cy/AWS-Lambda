@@ -77,6 +77,11 @@ def lambda_handler(event, context):
                         print(f"Failed to send email to {owner_email}: {e}")
                     except Exception as e:
                         print(f"Error sending email to {owner_email}: {e}")
+                # Add the "Stopped by" tag unless it already exists
+                stopped_by_tag = get_instance_tag_value(ec2_client, instance_id, 'Stopped by')
+                if not stopped_by_tag:
+                    ec2_resource.Instance(instance_id).create_tags(Tags=[{'Key': 'Stopped by', 'Value': 'Lambda'}])
+                    print(f"Added 'Stopped by: Lambda' tag to instance {instance_id}")
 
             else:
                 print(f"Instance {instance_id} ({instance_type}) does not meet the threshold for all consecutive days. Skipping instance...")
