@@ -1,0 +1,59 @@
+import boto3
+import datetime as dt
+
+# Get a list of all regions
+client = boto3.client('ec2')
+regions = [region['RegionName'] for region in client.describe_regions()['Regions']]
+
+def create_snapshot(ec2, instance_id, region):
+    instance = ec2.Instance(instance_id)
+    instance_name = None
+    for tag in instance.tags:
+        if tag['Key'] == 'Name':
+            instance_name = tag['Value']
+            break
+    
+    if instance_name:
+        snapshot_name = f"{instance_name}_{dt.datetime.utcnow().strftime('%Y-%m-%d_%H-%M-%S')}"
+        description = "killed by lambda"
+        
+        response = ec2.create_snapshot(
+            Description=description,
+            VolumeId=instance.block_device_mappings[0]['Ebs']['VolumeId']
+        )
+        
+        snapshot_id = response['SnapshotId']
+        print(f"Snapshot {snapshot_id} created for instance {instance_id} in region {region}.")
+    else:
+        print(f"Instance {instance_id} does not have a Name tag. Skipping snapshot creation.")
+
+def lambda_handler(event, context):
+    # Set threshold for number of days instances have been stopped
+    stopped_days_threshold = 15
+    # Get current time
+    now = dt.datetime.utcnow()
+
+    # Loop through regions
+    for region in regions:
+        # Connect to EC2
+        ec2 = boto3.client('ec2', region_name=region)
+        instances = ec2.describe_instances(Filters=[
+            {'Name': 'instance-state-name', 'Values': ['stopped']},
+            {'Name': 'tag:Stopped by', 'Values': ['Lambda']}
+        ])
+        for reservation in instances["Reservations"]:
+            for instance in reservation["Instances"]:
+                state = instance["State"]["Name"]
+                if state == "stopped":
+                    try:
+                        event = ec2.describe_instance_status(InstanceIds=[instance["InstanceId"]])
+                        stop_time = event["InstanceStatuses"][0]["Events"][0]["NotBefore"]
+                        stop_time = dt.datetime.strptime(stop_time, '%Y-%m-%dT%H:%M:%S.%fZ')
+                    except:
+                        stop_time = instance["LaunchTime"]
+                    stop_time = stop_time.replace(tzinfo=None)
+                    stopped_days = now - stop_time
+                    stopped_days = stopped_days.days
+                    if stopped_days > stopped_days_threshold:
+                        ec2.terminate_instances(InstanceIds=[instance["InstanceId"]])
+                        print(f'Instance {instance["InstanceId"]} terminated in region {region}')
