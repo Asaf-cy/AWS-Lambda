@@ -31,7 +31,7 @@ def lambda_handler(event, context):
                                         if rule['IpRanges'] and rule['IpRanges'][0]['CidrIp'] == '0.0.0.0/0':
                                             try:
                                                 ec2_region.revoke_security_group_ingress(GroupId=group_id, IpPermissions=[rule])
-                                                ec2_region.authorize_security_group_ingress(GroupId=group_id, IpPermissions=[{'IpProtocol': rule['IpProtocol'], 'FromPort': rule['FromPort'], 'ToPort': rule['ToPort'], 'IpRanges': [{'CidrIp': '31.168.164.190/32'}]}])
+                                                ec2_region.authorize_security_group_ingress(GroupId=group_id, IpPermissions=[{'IpProtocol': rule['IpProtocol'], 'FromPort': rule['FromPort'], 'ToPort': rule['ToPort'], 'IpRanges': [{'CidrIp': 'X.X.X.X/32'}]}])
                                             except Exception as e:
                                                 print("Failed to update the security group rule: ", e)
                                             
