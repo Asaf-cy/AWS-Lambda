@@ -1,0 +1,113 @@
+import boto3
+import json
+
+def lambda_handler(event, context):
+    rule_name = 'test'  # Consider parameterizing this value to increase flexibility.
+    source_region = 'us-east-1'  # Similar to above, consider parameterizing the source region.
+
+    # Fetch available regions dynamically
+    ec2_client = boto3.client('ec2', region_name=source_region)
+    try:
+        available_regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
+    except boto3.exceptions.Boto3Error as e:
+        print(f"Error fetching available regions: {e}")
+        return {
+            'statusCode': 500,
+            'body': f"Error fetching available regions: {str(e)}"
+        }
+    client = boto3.client('events', region_name=source_region)
+
+    # Get the rule details from the source region
+    try:
+        source_rule = client.describe_rule(Name=rule_name)
+        print(f"Source rule in {source_region}: {json.dumps(source_rule, indent=2)}")
+    except client.exceptions.ResourceNotFoundException:
+        return {
+            'statusCode': 404,
+            'body': f'Rule {rule_name} not found in source region {source_region}'
+        }
+    except boto3.exceptions.Boto3Error as e:
+        print(f"Error describing rule in {source_region}: {e}")
+        return {
+            'statusCode': 500,
+            'body': f"Error describing rule in {source_region}: {str(e)}"
+        }
+
+    # Get the targets from the source rule
+    try:
+        source_targets = client.list_targets_by_rule(Rule=rule_name)['Targets']
+        print(f"Source targets in {source_region}: {json.dumps(source_targets, indent=2)}")
+    except boto3.exceptions.Boto3Error as e:
+        print(f"Error listing targets by rule in {source_region}: {e}")
+        return {
+            'statusCode': 500,
+            'body': f"Error listing targets by rule in {source_region}: {str(e)}"
+        }
+
+    # Modify targets for the specific region
+    def adjust_target_arn(target, region):
+        if 'Arn' in target:
+            arn_parts = target['Arn'].split(':')
+            # Replace the region part of the ARN
+            arn_parts[3] = region
+            target['Arn'] = ':'.join(arn_parts)
+        return target
+
+    put_rule_params = {
+        'Name': rule_name,
+        'ScheduleExpression': source_rule.get('ScheduleExpression', ''),
+        'EventPattern': source_rule.get('EventPattern', ''),
+        'State': source_rule['State'],
+        'Description': source_rule.get('Description', '')
+    }
+
+    if 'RoleArn' in source_rule and source_rule['RoleArn']:
+        put_rule_params['RoleArn'] = source_rule['RoleArn']
+
+    # Update or create the rule and targets in the target regions
+    for region in available_regions:
+        if region == source_region:
+            continue
+        target_client = boto3.client('events', region_name=region)
+        try:
+            target_rule = target_client.describe_rule(Name=rule_name)
+            print(f"Target rule in {region}: {json.dumps(target_rule, indent=2)}")
+
+            # Compare and update the rule if needed
+            needs_update = (
+                target_rule.get('ScheduleExpression') != source_rule.get('ScheduleExpression') or
+                target_rule.get('EventPattern') != source_rule.get('EventPattern') or
+                target_rule['State'] != source_rule['State'] or
+                target_rule.get('Description') != source_rule.get('Description') or
+                ('RoleArn' in target_rule and target_rule['RoleArn'] != source_rule.get('RoleArn'))
+            )
+
+            if needs_update:
+                target_client.put_rule(**put_rule_params)
+                print(f'Rule {rule_name} updated in region {region}')
+            else:
+                print(f'Rule {rule_name} in region {region} is already up-to-date')
+
+            # Adjust targets for the region
+            adjusted_targets = [adjust_target_arn(target, region) for target in source_targets]
+            print(f'Adjusted targets for region {region}: {json.dumps(adjusted_targets, indent=2)}')
+
+            # Update the targets for the rule
+            target_client.put_targets(Rule=rule_name, Targets=adjusted_targets)
+            print(f'Targets for rule {rule_name} updated in region {region}')
+
+        except target_client.exceptions.ResourceNotFoundException:
+            print(f'Rule {rule_name} not found in region {region}, skipping to the next region')
+            continue  # Skip to the next region if the rule does not exist
+
+        except boto3.exceptions.Boto3Error as e:
+            print(f'Error updating rule or targets in region {region}: {e}')
+            return {
+                'statusCode': 500,
+                'body': f"Error updating rule or targets in region {region}: {str(e)}"
+            }
+
+    return {
+        'statusCode': 200,
+        'body': f'Rule {rule_name} and targets checked and updated across regions if needed'
+    }
