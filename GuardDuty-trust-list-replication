@@ -1,0 +1,96 @@
+import boto3
+
+def lambda_handler(event, context):
+    # Define the source region
+    source_region = 'us-east-1'
+    
+    # Initialize GuardDuty clients for the source region
+    gd_source_client = boto3.client('guardduty', region_name=source_region)
+    
+    # Get the detector ID in the source region
+    detector_id_source = get_detector_id(gd_source_client)
+    
+    # Get the list of trusted IPs from the source region
+    trusted_ips = gd_source_client.list_ip_sets(DetectorId=detector_id_source)
+    
+    # Check if there's any trusted IP list
+    if len(trusted_ips['IpSetIds']) == 0:
+        return {
+            'statusCode': 400,
+            'body': 'No trusted IP list found in source region.'
+        }
+    
+    # Get details of the trusted IP list from source region
+    ip_set_id = trusted_ips['IpSetIds'][0]  # Assuming one IP set
+    ip_set_details = gd_source_client.get_ip_set(
+        DetectorId=detector_id_source,
+        IpSetId=ip_set_id
+    )
+    
+    ip_set_name = ip_set_details['Name']
+    ip_set_location = ip_set_details['Location']
+    
+    # Define the target regions (excluding source region)
+    ec2_client = boto3.client('ec2')
+    regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
+    regions.remove(source_region)
+    
+    replication_results = {}
+    
+    # Replicate the trusted IP list to other regions
+    for region in regions:
+        gd_target_client = boto3.client('guardduty', region_name=region)
+        detector_id_target = get_detector_id(gd_target_client)
+        
+        try:
+            # Check if the IP set already exists
+            existing_ip_sets = gd_target_client.list_ip_sets(DetectorId=detector_id_target)
+            existing_ip_set_id = None
+            
+            for existing_ip_set in existing_ip_sets['IpSetIds']:
+                existing_ip_set_details = gd_target_client.get_ip_set(
+                    DetectorId=detector_id_target,
+                    IpSetId=existing_ip_set
+                )
+                if existing_ip_set_details['Name'] == ip_set_name:
+                    existing_ip_set_id = existing_ip_set
+                    break
+            
+            if existing_ip_set_id:
+                # Update the existing IP set
+                gd_target_client.update_ip_set(
+                    DetectorId=detector_id_target,
+                    IpSetId=existing_ip_set_id,
+                    Name=ip_set_name,
+                    Location=ip_set_location,
+                    Activate=ip_set_details['Status'] == 'ACTIVE'
+                )
+                replication_results[region] = f'Updated existing IP set {ip_set_name}.'
+            else:
+                # Create the IP set in the target region
+                gd_target_client.create_ip_set(
+                    DetectorId=detector_id_target,
+                    Name=ip_set_name,
+                    Format=ip_set_details['Format'],
+                    Location=ip_set_location,
+                    Activate=ip_set_details['Status'] == 'ACTIVE'
+                )
+                replication_results[region] = f'Successfully created IP set {ip_set_name}.'
+                
+        except Exception as e:
+            replication_results[region] = f'Failed to replicate {ip_set_name}: {str(e)}'
+    
+    # Log the results
+    for region, result in replication_results.items():
+        print(f'Region: {region} - {result}')
+    
+    return {
+        'statusCode': 200,
+        'body': replication_results
+    }
+
+def get_detector_id(client):
+    detectors = client.list_detectors()
+    if len(detectors['DetectorIds']) == 0:
+        raise Exception('No GuardDuty detectors found in this region.')
+    return detectors['DetectorIds'][0]
