@@ -1,0 +1,62 @@
+import boto3
+import json
+
+def lambda_handler(event, context):
+    # Initialize clients
+    guardduty_client = boto3.client('guardduty')
+    ec2_client = boto3.client('ec2')
+    
+    # Get list of all regions
+    regions = [region['RegionName'] for region in ec2_client.describe_regions()['Regions']]
+    
+    # Function to get suppression rules and their filters for a region
+    def get_suppression_rules_and_filters(region):
+        client = boto3.client('guardduty', region_name=region)
+        detector_id = get_detector_id(client)
+        rules_and_filters = {}
+        if detector_id:
+            paginator = client.get_paginator('list_filters')
+            for page in paginator.paginate(DetectorId=detector_id):
+                for filter_name in page['FilterNames']:
+                    filter_details = client.get_filter(
+                        DetectorId=detector_id,
+                        FilterName=filter_name
+                    )
+                    rules_and_filters[filter_name] = filter_details['FindingCriteria']
+        return rules_and_filters
+    
+    # Function to get the detector ID
+    def get_detector_id(client):
+        response = client.list_detectors()
+        return response['DetectorIds'][0] if response['DetectorIds'] else None
+    
+    # Collect all suppression rules and filters across all regions
+    region_rules_and_filters = {region: get_suppression_rules_and_filters(region) for region in regions}
+    
+    # Find the union of all suppression rules and their filters
+    all_rules_and_filters = {}
+    for rules_and_filters in region_rules_and_filters.values():
+        all_rules_and_filters.update(rules_and_filters)
+    
+    # Function to create missing rules in a region
+    def create_missing_rules(region, missing_rules_and_filters):
+        client = boto3.client('guardduty', region_name=region)
+        detector_id = get_detector_id(client)
+        for rule_name, criteria in missing_rules_and_filters.items():
+            client.create_filter(
+                DetectorId=detector_id,
+                Name=rule_name,
+                Action='NOOP',  # This can be adjusted based on actual action needed
+                FindingCriteria=criteria
+            )
+    
+    # Ensure all regions have the complete set of rules and filters
+    for region, rules_and_filters in region_rules_and_filters.items():
+        missing_rules_and_filters = {rule: criteria for rule, criteria in all_rules_and_filters.items() if rule not in rules_and_filters}
+        if missing_rules_and_filters:
+            create_missing_rules(region, missing_rules_and_filters)
+    
+    return {
+        'statusCode': 200,
+        'body': 'Suppression rules and filters unified across all regions.'
+    }
