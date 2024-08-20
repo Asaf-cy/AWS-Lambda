@@ -1,0 +1,30 @@
+import boto3
+import json
+
+def archive_guardduty_findings(region):
+    client = boto3.client('guardduty', region_name=region)
+    detectors = client.list_detectors()
+    if 'DetectorIds' in detectors and len(detectors['DetectorIds']) > 0:
+        detector_id = detectors['DetectorIds'][0]
+        findings = client.list_findings(DetectorId=detector_id)
+        if 'FindingIds' in findings and len(findings['FindingIds']) > 0:
+            client.archive_findings(DetectorId=detector_id, FindingIds=findings['FindingIds'])
+            return len(findings['FindingIds'])
+    return 0
+
+def lambda_handler(event, context):
+    regions = boto3.session.Session().get_available_regions('guardduty')
+    total_archived = 0
+    
+    for region in regions:
+        try:
+            archived_count = archive_guardduty_findings(region)
+            print(f"Archived {archived_count} findings in region {region}")
+            total_archived += archived_count
+        except Exception as e:
+            print(f"Error archiving findings in region {region}: {str(e)}")
+    
+    return {
+        'statusCode': 200,
+        'body': json.dumps(f'Total archived findings: {total_archived}')
+    }
