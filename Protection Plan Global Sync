@@ -1,0 +1,208 @@
+import boto3
+import json
+from datetime import datetime
+
+# Specify the source region at the top
+source_region = 'us-east-1'
+
+# Custom serializer to handle non-serializable objects like datetime
+def json_serializer(obj):
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+def get_all_regions():
+    """Retrieve a list of all available AWS regions."""
+    ec2_client = boto3.client('ec2')
+    regions = ec2_client.describe_regions()['Regions']
+    return [region['RegionName'] for region in regions]
+
+def get_detector_ids(region):
+    """Retrieve the Detector IDs for all accounts in the given region."""
+    client = boto3.client('guardduty', region_name=region)
+    detectors = client.list_detectors()
+    
+    print(f"Retrieved detector IDs in region {region}: {detectors['DetectorIds']}")
+    
+    if detectors['DetectorIds']:
+        return detectors['DetectorIds'][0]  # Assuming one detector per account
+    return None
+
+def list_member_accounts(client, detector_id):
+    """Retrieve a list of member account IDs with their statuses (enabled/disabled)."""
+    account_ids = []
+    next_token = None
+    
+    while True:
+        if next_token:
+            response = client.list_members(
+                DetectorId=detector_id,
+                OnlyAssociated='TRUE',
+                NextToken=next_token
+            )
+        else:
+            response = client.list_members(
+                DetectorId=detector_id,
+                OnlyAssociated='TRUE'
+            )
+        
+        # Filter to include only enabled members
+        for member in response['Members']:
+            if member['RelationshipStatus'] == 'Enabled':
+                account_ids.append(member['AccountId'])
+        
+        next_token = response.get('NextToken')
+        if not next_token:
+            break
+    
+    print(f"Retrieved enabled member account IDs: {account_ids}")
+    
+    return account_ids
+
+def sanitize_data_sources(data_sources):
+    """Ensure DataSources has the correct parameters and data types."""
+    sanitized_sources = {}
+    
+    # Handling S3Logs
+    if 'S3Logs' in data_sources:
+        sanitized_sources['S3Logs'] = {
+            'Enable': data_sources['S3Logs'].get('Status', 'DISABLED') == 'ENABLED'
+        }
+    
+    # Handling Kubernetes Logs
+    if 'Kubernetes' in data_sources and 'AuditLogs' in data_sources['Kubernetes']:
+        sanitized_sources['Kubernetes'] = {
+            'AuditLogs': {
+                'Enable': data_sources['Kubernetes']['AuditLogs'].get('Status', 'DISABLED') == 'ENABLED'
+            }
+        }
+    
+    # Handling MalwareProtection
+    if 'MalwareProtection' in data_sources and 'ScanEc2InstanceWithFindings' in data_sources['MalwareProtection']:
+        sanitized_sources['MalwareProtection'] = {
+            'ScanEc2InstanceWithFindings': {
+                'EbsVolumes': data_sources['MalwareProtection']['ScanEc2InstanceWithFindings'].get('EbsVolumes', {}).get('Status') == 'ENABLED'
+            }
+        }
+    
+    return sanitized_sources
+
+def sanitize_features(features):
+    """Ensure Features has the correct parameters and remove any unnecessary or conflicting fields."""
+    sanitized_features = []
+    
+    for feature in features:
+        # Skip invalid features
+        if feature['Name'] in ['FLOW_LOGS', 'DNS_LOGS', 'CLOUD_TRAIL']:
+            continue
+        
+        # Skip RUNTIME_MONITORING due to company policy
+        if feature['Name'] == 'RUNTIME_MONITORING':
+            continue
+        
+        # Handle EKS_RUNTIME_MONITORING only, skipping RUNTIME_MONITORING
+        sanitized_feature = {
+            'Name': feature['Name'],
+            'Status': feature['Status']
+        }
+        # Handle AdditionalConfiguration, if present
+        if 'AdditionalConfiguration' in feature:
+            sanitized_feature['AdditionalConfiguration'] = [
+                {
+                    'Name': config['Name'],
+                    'Status': config['Status']
+                }
+                for config in feature['AdditionalConfiguration']
+            ]
+        sanitized_features.append(sanitized_feature)
+    
+    return sanitized_features
+
+def get_member_detectors(client, detector_id, account_ids):
+    """Retrieve member detector details using GetMemberDetectors."""
+    if not account_ids:
+        return {}
+
+    response = client.get_member_detectors(
+        DetectorId=detector_id,
+        AccountIds=account_ids
+    )
+    
+    # Extract DataSources and Features from the response, which is a list
+    member_data_sources = {}
+    for member_info in response.get('MemberDataSourceConfigurations', []):
+        account_id = member_info.get('AccountId')
+        if account_id:
+            member_data_sources[account_id] = {
+                'DataSources': sanitize_data_sources(member_info.get('DataSources', {})),
+                'Features': sanitize_features(member_info.get('Features', []))
+            }
+    
+    return member_data_sources
+
+def update_member_detectors(client, detector_id, account_ids, member_data_sources):
+    """Update member detectors by separating DataSources and Features into separate API calls."""
+    if not account_ids:
+        print("No accounts to update.")
+        return
+    
+    for account_id in account_ids:
+        data_source_config = member_data_sources.get(account_id, {})
+        
+        # If there are DataSources, send a separate API call for DataSources
+        if data_source_config.get('DataSources'):
+            print(f"Updating DataSources for account: {account_id}")
+            client.update_member_detectors(
+                DetectorId=detector_id,
+                AccountIds=[account_id],
+                DataSources=data_source_config.get('DataSources')
+            )
+        
+        # If there are Features, send a separate API call for Features
+        if data_source_config.get('Features'):
+            print(f"Updating Features for account: {account_id}")
+            client.update_member_detectors(
+                DetectorId=detector_id,
+                AccountIds=[account_id],
+                Features=data_source_config.get('Features')
+            )
+
+def sync_member_detectors(source_region):
+    """Sync member detector settings from source region to all other regions."""
+    client = boto3.client('guardduty', region_name=source_region)
+    detector_id = get_detector_ids(source_region)
+    
+    if not detector_id:
+        print(f"No detectors found in source region: {source_region}")
+        return
+    
+    # Step 1: Get list of enabled member account IDs in the source region
+    member_account_ids = list_member_accounts(client, detector_id)
+    
+    if not member_account_ids:
+        print(f"No enabled members found in the source region {source_region}")
+        return
+    
+    # Step 2: Get member detector details from the source region
+    member_data_sources = get_member_detectors(client, detector_id, member_account_ids)
+    print(f"Retrieved data source configurations for source region {source_region}: {json.dumps(member_data_sources, indent=2, default=json_serializer)}")
+    
+    # Step 3: Loop through all available regions and sync the member detectors
+    all_regions = get_all_regions()
+    for region in all_regions:
+        if region == source_region:
+            continue  # Skip the source region
+        client = boto3.client('guardduty', region_name=region)
+        target_detector_id = get_detector_ids(region)
+        
+        if target_detector_id:
+            print(f"Syncing member detectors to region: {region}")
+            update_member_detectors(client, target_detector_id, member_account_ids, member_data_sources)
+        else:
+            print(f"No detector found for region: {region}")
+
+def lambda_handler(event, context):
+    # Sync member detectors from the source region to all other regions
+    sync_member_detectors(source_region)
+    
+    return "GuardDuty member detectors synchronized successfully."
