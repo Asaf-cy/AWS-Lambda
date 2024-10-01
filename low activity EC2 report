@@ -8,64 +8,68 @@ def get_instance_name(instance):
     return 'N/A'
 
 def lambda_handler(event, context):
-    regions = ['us-east-1', 'us-west-1', 'us-west-2', 'eu-west-1', 'eu-central-1']  # Add more regions as needed
-
+    # Fetch all available regions dynamically
+    ec2_client = boto3.client('ec2')
+    response = ec2_client.describe_regions()
+    regions = [region['RegionName'] for region in response['Regions']]
+    
     low_activity_instances = []
 
     for region in regions:
-        ec2 = boto3.client('ec2', region_name=region)
-        cw = boto3.client('cloudwatch', region_name=region)
-        
-        # Get instances in the region
-        instances = ec2.describe_instances()
+        try:
+            ec2 = boto3.client('ec2', region_name=region)
+            cw = boto3.client('cloudwatch', region_name=region)
+            
+            # Get instances in the region
+            instances = ec2.describe_instances()
+        except Exception as e:
+            print(f"Error fetching instances or CloudWatch data for region {region}: {str(e)}")
+            continue
         
         for reservation in instances['Reservations']:
             for instance in reservation['Instances']:
                 instance_id = instance['InstanceId']
-                
-                # Get instance name from 'Name' tag
                 instance_name = get_instance_name(instance)
-                
-                # Get instance type
                 instance_type = instance['InstanceType']
+
+                # Fetch CPU and network metrics
+                try:
+                    cpu_metric = cw.get_metric_statistics(
+                        Namespace='AWS/EC2',
+                        MetricName='CPUUtilization',
+                        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                        StartTime=datetime.utcnow() - timedelta(days=30),
+                        EndTime=datetime.utcnow(),
+                        Period=86400,
+                        Statistics=['Average']
+                    )
+                    network_in_metric = cw.get_metric_statistics(
+                        Namespace='AWS/EC2',
+                        MetricName='NetworkIn',
+                        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                        StartTime=datetime.utcnow() - timedelta(days=30),
+                        EndTime=datetime.utcnow(),
+                        Period=86400,
+                        Statistics=['Average']
+                    )
+                    network_out_metric = cw.get_metric_statistics(
+                        Namespace='AWS/EC2',
+                        MetricName='NetworkOut',
+                        Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
+                        StartTime=datetime.utcnow() - timedelta(days=30),
+                        EndTime=datetime.utcnow(),
+                        Period=86400,
+                        Statistics=['Average']
+                    )
+                except Exception as e:
+                    print(f"Error fetching CloudWatch metrics for instance {instance_id} in region {region}: {str(e)}")
+                    continue
                 
-                # Get CPU utilization metric (average across 30 days)
-                cpu_metric = cw.get_metric_statistics(
-                    Namespace='AWS/EC2',
-                    MetricName='CPUUtilization',
-                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                    StartTime=datetime.now() - timedelta(days=30),
-                    EndTime=datetime.now(),
-                    Period=86400,
-                    Statistics=['Average']
-                )
-                
-                # Get NetworkIn metric (average across 30 days)
-                network_in_metric = cw.get_metric_statistics(
-                    Namespace='AWS/EC2',
-                    MetricName='NetworkIn',
-                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                    StartTime=datetime.now() - timedelta(days=30),
-                    EndTime=datetime.now(),
-                    Period=86400,
-                    Statistics=['Average']
-                )
-                
-                # Get NetworkOut metric (average across 30 days)
-                network_out_metric = cw.get_metric_statistics(
-                    Namespace='AWS/EC2',
-                    MetricName='NetworkOut',
-                    Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}],
-                    StartTime=datetime.now() - timedelta(days=30),
-                    EndTime=datetime.now(),
-                    Period=86400,
-                    Statistics=['Average']
-                )
-                
+                # Check if the instance has low activity
                 if (cpu_metric['Datapoints'] and
-                    cpu_metric['Datapoints'][0]['Average'] < 1 and
                     network_in_metric['Datapoints'] and
                     network_out_metric['Datapoints'] and
+                    cpu_metric['Datapoints'][0]['Average'] < 0.3 and
                     network_in_metric['Datapoints'][0]['Average'] < 30000 and
                     network_out_metric['Datapoints'][0]['Average'] < 40000):
                     
@@ -79,18 +83,17 @@ def lambda_handler(event, context):
                         'Average Network Out': network_out_metric['Datapoints'][0]['Average']
                     })
 
-    # Print low activity instances
-    for instance in low_activity_instances:
-        print(f"Low Activity EC2 Instance in {instance['Region']}:")
-        print(f"Instance Name: {instance['InstanceName']}")
-        print(f"Instance ID: {instance['InstanceId']}")
-        print(f"Instance Type: {instance['InstanceType']}")
-        print(f"Average CPU Utilization: {instance['Average CPU Utilization']}%")
-        print(f"Average Network In: {instance['Average Network In']} Bytes")
-        print(f"Average Network Out: {instance['Average Network Out']} Bytes")
-        print("---")
-
+    if low_activity_instances:
+        for instance in low_activity_instances:
+            print(f"Low Activity EC2 Instance in {instance['Region']}:\n"
+                  f"Instance Name: {instance['InstanceName']}\n"
+                  f"Instance ID: {instance['InstanceId']}\n"
+                  f"Instance Type: {instance['InstanceType']}\n"
+                  f"Average CPU Utilization: {instance['Average CPU Utilization']}%\n"
+                  f"Average Network In: {instance['Average Network In']} Bytes\n"
+                  f"Average Network Out: {instance['Average Network Out']} Bytes\n---")
+    
     return {
         'statusCode': 200,
-        'body': 'Low activity instances identified and printed.'
+        'body': low_activity_instances
     }
