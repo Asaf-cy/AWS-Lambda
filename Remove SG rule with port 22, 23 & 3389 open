@@ -1,123 +1,168 @@
 import boto3
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os
+from collections import defaultdict
 
-# Amazon SES SMTP Configuration
-SMTP_SERVER = "email-smtp.us-east-1.amazonaws.com"
-SMTP_PORT = 587
-SMTP_USERNAME = "censored"
-SMTP_PASSWORD = "censored"
-SENDER_EMAIL = "asaf@censored.com"
-
+# SES + Config
+SENDER_EMAIL = "asaf.censored@censored.com"
+SECURITY_TEAM_EMAIL = "security@censored.com"
+ACCOUNT_ALIAS_ENV = "ACCOUNT_EMAIL_ALIAS"
 TARGET_PORTS = {22, 23, 3389}
 
+ses = boto3.client('ses')
+ec2 = boto3.client('ec2')
+
 def lambda_handler(event, context):
-    try:
-        ec2 = boto3.client('ec2')
-        regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+    regions = [r['RegionName'] for r in ec2.describe_regions()['Regions']]
+    findings = defaultdict(list)
 
-        for region in regions:
-            try:
-                ec2_region = boto3.client('ec2', region_name=region)
+    for region in regions:
+        try:
+            ec2_region = boto3.client('ec2', region_name=region)
+            public_instances = get_instances_with_public_ips(ec2_region)
 
-                elastic_ips = ec2_region.describe_addresses()['Addresses']
-                instance_ids_with_eip = {eip['InstanceId'] for eip in elastic_ips if 'InstanceId' in eip}
+            if not public_instances:
+                print(f"No instances with public IP in {region}. Skipping...")
+                continue
 
-                if not instance_ids_with_eip:
-                    print(f"No instances with Elastic IP in {region}. Skipping...")
+            print(f"✔ Found {len(public_instances)} public instance(s) in {region}")
+
+            reservations = ec2_region.describe_instances(
+                Filters=[{'Name': 'instance-id', 'Values': list(public_instances)}]
+            )['Reservations']
+
+            for reservation in reservations:
+                for instance in reservation['Instances']:
+                    instance_id = instance['InstanceId']
+                    instance_name = get_tag(instance, 'Name') or "Unnamed Instance"
+                    owner_email = get_tag(instance, 'owner')
+
+                    print(f"\n🔍 Checking instance {instance_name} ({instance_id}) in {region}")
+
+                    if instance_has_tag(instance, 'MyTag'):
+                        print("⏭ Skipped: Has MyTag")
+                        continue
+
+                    sg_changes = []
+                    for sg in instance['SecurityGroups']:
+                        sg_id, sg_name = sg['GroupId'], sg['GroupName']
+                        try:
+                            sg_detail = ec2_region.describe_security_groups(GroupIds=[sg_id])['SecurityGroups'][0]
+                            for rule in sg_detail['IpPermissions']:
+                                protocol = rule.get("IpProtocol")
+                                from_port = rule.get("FromPort")
+                                cidrs = [ip.get('CidrIp') for ip in rule.get('IpRanges', [])]
+                                has_open_cidr = '0.0.0.0/0' in cidrs
+                                is_all_traffic = protocol == "-1"
+                                is_target_port = from_port in TARGET_PORTS
+
+                                if has_open_cidr and (is_target_port or is_all_traffic):
+                                    ec2_region.revoke_security_group_ingress(GroupId=sg_id, IpPermissions=[rule])
+                                    removed = "All Traffic" if is_all_traffic else f"Port {from_port}"
+                                    print(f"✅ Removed {removed} from SG ({sg_name}) on instance {instance_name}")
+                                    sg_changes.append((sg_name, removed))
+                        except Exception as e:
+                            print(f"❌ Error checking SG {sg_name}: {e}")
+
+                    if sg_changes:
+                        findings[owner_email].append({
+                            'region': region,
+                            'instance_name': instance_name,
+                            'instance_id': instance_id,
+                            'sg_changes': sg_changes
+                        })
+
+        except Exception as e:
+            print(f"❌ Error processing region {region}: {e}")
+
+    for owner_email, instances in findings.items():
+        recipients = []
+
+        if is_valid_email(owner_email):
+            recipients.append(owner_email)
+        else:
+            print(f"⚠️ Invalid or missing owner tag, skipping owner email")
+
+        recipients.append(SECURITY_TEAM_EMAIL)
+
+        account_email = os.environ.get(ACCOUNT_ALIAS_ENV)
+        if account_email:
+            recipients.append(account_email)
+
+        recipients = list(set(recipients))  # remove dups
+        subject = "[Security Cleanup] Open ports removed from your EC2 instances"
+        message = build_owner_email(instances)
+
+        send_email_ses(recipients, subject, message)
+
+# ------------------ Helpers ------------------
+
+def get_instances_with_public_ips(ec2_client):
+    public_instances = set()
+    paginator = ec2_client.get_paginator('describe_instances')
+    for page in paginator.paginate(Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]):
+        for reservation in page['Reservations']:
+            for instance in reservation['Instances']:
+                instance_id = instance['InstanceId']
+                if 'PublicIpAddress' in instance:
+                    print(f"🌐 Public IP: {instance['PublicIpAddress']} on instance {instance_id}")
+                    public_instances.add(instance_id)
                     continue
+                for iface in instance.get("NetworkInterfaces", []):
+                    public_ip = iface.get("Association", {}).get("PublicIp")
+                    if public_ip:
+                        print(f"🌐 Public IP: {public_ip} (interface-level) on instance {instance_id}")
+                        public_instances.add(instance_id)
+                        break
+    return public_instances
 
-                reservations = ec2_region.describe_instances(Filters=[{'Name': 'instance-id', 'Values': list(instance_ids_with_eip)}])['Reservations']
-
-                for reservation in reservations:
-                    for instance in reservation['Instances']:
-                        instance_id = instance['InstanceId']
-                        instance_name = get_instance_name(instance)
-
-                        if instance_has_tag(ec2_region, instance_id, 'MyTag'):
-                            continue
-
-                        sg_modified_ports = []
-                        security_groups = {sg['GroupId']: sg['GroupName'] for sg in instance['SecurityGroups']}
-
-                        for sg_id, sg_name in security_groups.items():
-                            try:
-                                sg_details = ec2_region.describe_security_groups(GroupIds=[sg_id])['SecurityGroups'][0]
-                                inbound_rules = sg_details['IpPermissions']
-
-                                for rule in inbound_rules:
-                                    if 'FromPort' in rule and rule['FromPort'] in TARGET_PORTS:
-                                        if any(ip.get('CidrIp') == '0.0.0.0/0' for ip in rule.get('IpRanges', [])):
-                                            try:
-                                                ec2_region.revoke_security_group_ingress(GroupId=sg_id, IpPermissions=[rule])
-                                                print(f"Deleted unrestricted rule [Port: {rule['FromPort']}] from Security Group ({sg_name}) for instance ({instance_name}) in {region}")
-                                                sg_modified_ports.append(str(rule['FromPort']))
-                                            except Exception as e:
-                                                print(f"Failed to delete rule from Security Group ({sg_name}) in {region}: {e}")
-                            except Exception as e:
-                                print(f"Error processing Security Group ({sg_name}) in {region}: {e}")
-
-                        # If any ports were modified, send an email to the owner
-                        if sg_modified_ports:
-                            owner_email = get_instance_tag_value(ec2_region, instance_id, 'owner')
-                            if owner_email:
-                                subject = f"[Security Cleanup] Open ports removed on {instance_name or instance_id}"
-                                message = (
-                                    f"Hi,\n\n"
-                                    f"The following open ports were removed from instance ({instance_name}) in region {region}:\n"
-                                    f"{', '.join(sg_modified_ports)}\n\n"
-                                    f"The instance had an Elastic IP and open access from 0.0.0.0/0, which posed a security risk.\n\n"
-                                    f"Please review and reconfigure as needed.\n\n"
-                                    f"Thanks,\nSecurity Team"
-                                )
-                                send_email(owner_email, subject, message)
-            except Exception as e:
-                print(f"Error processing region {region}: {e}")
-    except Exception as e:
-        print(f"Failed to retrieve regions: {e}")
-
-def instance_has_tag(ec2_client, instance_id, tag_key):
-    try:
-        response = ec2_client.describe_instances(InstanceIds=[instance_id])
-        tags = response['Reservations'][0]['Instances'][0].get('Tags', [])
-        return any(tag['Key'] == tag_key for tag in tags)
-    except Exception as e:
-        print(f"Error checking tag {tag_key} on instance {instance_id}: {e}")
-        return False
-
-def get_instance_name(instance):
-    tags = instance.get('Tags', [])
-    for tag in tags:
-        if tag['Key'] == 'Name':
+def get_tag(instance, key):
+    for tag in instance.get('Tags', []):
+        if tag['Key'].lower() == key.lower():
             return tag['Value']
-    return "Unnamed Instance"
-
-def get_instance_tag_value(ec2_client, instance_id, tag_key):
-    try:
-        response = ec2_client.describe_instances(InstanceIds=[instance_id])
-        if response.get('Reservations'):
-            instance = response['Reservations'][0]['Instances'][0]
-            for tag in instance.get('Tags', []):
-                if tag['Key'].lower() == tag_key.lower():
-                    return tag['Value']
-    except Exception as e:
-        print(f"Error retrieving tag {tag_key} for instance {instance_id}: {e}")
     return None
 
-def send_email(recipient_email, subject, message):
+def instance_has_tag(instance, tag_key):
+    return any(tag['Key'].lower() == tag_key.lower() for tag in instance.get('Tags', []))
+
+def is_valid_email(email):
+    return email and "@" in email
+
+def build_owner_email(instances):
+    lines = ["Hi,\n\nThe following changes were made to your EC2 instances for security reasons:\n"]
+    has_all_traffic_rule = False
+
+    for inst in instances:
+        lines.append(f"🖥 Instance: {inst['instance_name']} ({inst['instance_id']}) in {inst['region']}")
+        for sg_name, removed in inst['sg_changes']:
+            lines.append(f"   🔐 Removed public rule: {removed} from SG: {sg_name}")
+            if "All Traffic" in removed:
+                has_all_traffic_rule = True
+        lines.append("")
+
+    # Tailored footer
+    if has_all_traffic_rule:
+        lines.append("⚠️ Allowing unrestricted access on *all ports* is a breach of company policy.")
+        lines.append("Please only allow required ports — you can do better 💪")
+    else:
+        lines.append("Please use AWS SSM for internal/private access.")
+        lines.append("These open ports violate company security policy.")
+
+    lines.append("\n– Security Team")
+    return "\n".join(lines)
+
+def send_email_ses(recipients, subject, message):
     try:
-        msg = MIMEMultipart()
-        msg['From'] = SENDER_EMAIL
-        msg['To'] = recipient_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(message, 'plain'))
-
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USERNAME, SMTP_PASSWORD)
-            server.sendmail(SENDER_EMAIL, recipient_email, msg.as_string())
-
-        print(f"Email successfully sent to {recipient_email}")
+        response = ses.send_email(
+            Source=SENDER_EMAIL,
+            Destination={"ToAddresses": recipients},
+            Message={
+                "Subject": {"Data": subject},
+                "Body": {"Text": {"Data": message}}
+            }
+        )
+        print(f"✅ Email sent to: {', '.join(recipients)} | Message ID: {response['MessageId']}")
     except Exception as e:
-        print(f"Failed to send email to {recipient_email}: {e}")
+        print(f"❌ Failed to send email to: {', '.join(recipients)}")
+        print(f"   ➤ Error: {e}")
+        print(f"   ➤ Subject: {subject}")
+        print(f"   ➤ Body preview:\n{message[:250]}...")
