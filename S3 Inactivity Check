@@ -1,103 +1,108 @@
 import boto3
 from datetime import datetime, timedelta, timezone
 
-# Define the S3 client
 s3_client = boto3.client("s3")
 
-# Define the time threshold (18 months) with timezone awareness
-threshold_date = datetime.now(timezone.utc) - timedelta(days=18*30)  # Approx. 18 months
-
-def check_bucket_activity(bucket_name):
-    """Check if a bucket has any files modified within the last 18 months.
-       Also counts total files and finds the most recent file modification date."""
-    paginator = s3_client.get_paginator('list_objects_v2')
-    page_iterator = paginator.paginate(Bucket=bucket_name)
-
-    total_files = 0
-    most_recent_file_date = None
-    is_inactive = True  # Assume inactive until proven otherwise
-
-    for page in page_iterator:
-        if "Contents" in page:
-            for obj in page["Contents"]:
-                total_files += 1  # Count total files
-                last_modified = obj["LastModified"]  # Already timezone-aware
-                
-                # Track the most recent file modification date
-                if most_recent_file_date is None or last_modified > most_recent_file_date:
-                    most_recent_file_date = last_modified
-                
-                # If any file is newer than the threshold, mark the bucket as active
-                if last_modified >= threshold_date:
-                    is_inactive = False  # Bucket is active
-                    return is_inactive, total_files, most_recent_file_date  # Stop further processing
-
-    # If no files exist, return None for most_recent_file_date
-    return is_inactive, total_files, most_recent_file_date
+# Inactivity threshold (adjust as needed)
+threshold_date = datetime.now(timezone.utc) - timedelta(days=18*30) #aprox 18 months
+MAX_KEYS_PER_PREFIX = 1000  # First-page limit per prefix
+MAX_TOTAL_FILES = 10000     # Cap total file checks
 
 def get_bucket_logging(bucket_name):
-    """Check if access logging is enabled and return the target bucket name."""
     response = s3_client.get_bucket_logging(Bucket=bucket_name)
-    
     if "LoggingEnabled" in response:
-        return response["LoggingEnabled"]["TargetBucket"], response["LoggingEnabled"]["TargetPrefix"], "Enabled"
-    
+        return (
+            response["LoggingEnabled"]["TargetBucket"],
+            response["LoggingEnabled"]["TargetPrefix"],
+            "Enabled"
+        )
     return None, None, "Disabled"
 
-def check_access_logs(target_bucket, target_prefix):
-    """Check if there are any access logs in the last 18 months."""
-    paginator = s3_client.get_paginator('list_objects_v2')
-    page_iterator = paginator.paginate(Bucket=target_bucket, Prefix=target_prefix)
+def get_latest_object_in_prefix(bucket_name, prefix):
+    """Return most recent object in prefix (first page only)."""
+    try:
+        response = s3_client.list_objects_v2(
+            Bucket=bucket_name,
+            Prefix=prefix,
+            MaxKeys=MAX_KEYS_PER_PREFIX
+        )
+        if "Contents" in response:
+            latest = max(response["Contents"], key=lambda o: o["LastModified"])
+            return latest["LastModified"], len(response["Contents"])
+    except Exception as e:
+        print(f"Error scanning {bucket_name}/{prefix}: {e}")
+    return None, 0
 
-    for page in page_iterator:
-        if "Contents" in page:
-            for obj in page["Contents"]:
-                last_modified = obj["LastModified"]  # Already timezone-aware
-                
-                # If an access log is newer than the threshold, return False (logs are recent)
-                if last_modified >= threshold_date:
-                    return False
-    return True  # No recent access logs found
+def get_top_level_prefixes(bucket_name):
+    """Get top-level folders, excluding SAL folders."""
+    prefixes = []
+    try:
+        response = s3_client.list_objects_v2(Bucket=bucket_name, Delimiter="/")
+        for p in response.get("CommonPrefixes", []):
+            prefix = p["Prefix"]
+            if not prefix.lower().startswith("access logs/"):
+                prefixes.append(prefix)
+    except Exception as e:
+        print(f"Prefix listing error in {bucket_name}: {e}")
+    return prefixes
+
+def get_latest_from_top_level_and_root(bucket_name):
+    """Scan root and top-level prefixes, return most recent file and total count."""
+    prefixes = get_top_level_prefixes(bucket_name)
+    prefixes.insert(0, "")  # Include root level
+
+    most_recent = None
+    total_files = 0
+    limit_reached = False
+
+    for prefix in prefixes:
+        latest, count = get_latest_object_in_prefix(bucket_name, prefix)
+        total_files += count
+        if total_files >= MAX_TOTAL_FILES:
+            limit_reached = True
+            break
+        if latest and (most_recent is None or latest > most_recent):
+            most_recent = latest
+
+    return most_recent, total_files, limit_reached
 
 def lambda_handler(event, context):
-    """Main Lambda function handler."""
     inactive_buckets = []
-
-    # List all buckets
-    response = s3_client.list_buckets()
-    buckets = response.get("Buckets", [])
+    buckets = s3_client.list_buckets().get("Buckets", [])
 
     for bucket in buckets:
         bucket_name = bucket["Name"]
         print(f"Checking bucket: {bucket_name}")
-        
-        # Check if all files are older than 18 months and count total files
-        is_inactive, total_files, most_recent_file_date = check_bucket_activity(bucket_name)
 
-        if is_inactive:
-            # Check if bucket has access logging enabled
-            log_bucket, log_prefix, logging_status = get_bucket_logging(bucket_name)
-            
-            if log_bucket:
-                print(f"Checking access logs in {log_bucket} with prefix {log_prefix}")
-                
-                # If access logs exist, check if they have recent entries
-                if check_access_logs(log_bucket, log_prefix):
-                    inactive_buckets.append({
-                        "BucketName": bucket_name,
-                        "LoggingStatus": logging_status,
-                        "TotalFiles": total_files,
-                        "MostRecentFileDate": most_recent_file_date.isoformat() if most_recent_file_date else "No Files"
-                    })
-            else:
-                inactive_buckets.append({
-                    "BucketName": bucket_name,
-                    "LoggingStatus": logging_status,
-                    "TotalFiles": total_files,
-                    "MostRecentFileDate": most_recent_file_date.isoformat() if most_recent_file_date else "No Files"
-                })
+        log_bucket, log_prefix, logging_status = get_bucket_logging(bucket_name)
 
-    print(f"Inactive Buckets (No activity in last 18 months): {inactive_buckets}")
-    
-    # Optionally store results in an S3 bucket or send notification
+        most_recent_file_date, total_files, limit_reached = get_latest_from_top_level_and_root(bucket_name)
+
+        most_recent_access_log_date = None
+        if logging_status == "Enabled" and log_bucket:
+            print(f"-> SAL enabled. Checking logs in {log_bucket}/{log_prefix}")
+            most_recent_access_log_date, _ = get_latest_object_in_prefix(log_bucket, log_prefix)
+        else:
+            most_recent_access_log_date = "N/A"
+
+        most_recent_activity = most_recent_file_date
+        if isinstance(most_recent_access_log_date, datetime):
+            if not most_recent_file_date or most_recent_access_log_date > most_recent_file_date:
+                most_recent_activity = most_recent_access_log_date
+
+        if not most_recent_activity or most_recent_activity < threshold_date:
+            inactive_buckets.append({
+                "BucketName": bucket_name,
+                "LoggingStatus": logging_status,
+                "TotalFiles": total_files,
+                "MostRecentFileDate": most_recent_file_date.isoformat() if isinstance(most_recent_file_date, datetime) else most_recent_file_date,
+                "MostRecentAccessLogDate": most_recent_access_log_date.isoformat() if isinstance(most_recent_access_log_date, datetime) else most_recent_access_log_date,
+                "MostRecentActivityDate": most_recent_activity.isoformat() if isinstance(most_recent_activity, datetime) else "No Activity",
+                "FileScanLimitReached": limit_reached
+            })
+
+    print("Inactive Buckets (no activity within threshold):")
+    for entry in inactive_buckets:
+        print(entry)
+
     return inactive_buckets
