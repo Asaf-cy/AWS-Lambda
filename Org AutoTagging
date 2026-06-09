@@ -1,0 +1,1252 @@
+import os
+import json
+import gzip
+import io
+import hashlib
+import logging
+import concurrent.futures
+import re
+from json import JSONDecoder
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote_plus
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import (
+    ClientError,
+    EndpointConnectionError,
+    ConnectionClosedError,
+    ReadTimeoutError,
+)
+
+# =========================
+# Runtime / logging
+# =========================
+WORKERS = int(os.getenv("WORKERS", "64"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logger = logging.getLogger()
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+# =========================
+# General config
+# =========================
+ORG_ID = os.getenv("ORG_ID", "[ORG_ID]")
+ROLE_NAME = os.getenv("ROLE_NAME", "CrossAccountResourceTaggerRole")
+ROLE_SESSION_NAME = os.getenv("ROLE_SESSION_NAME", "TaggerSession")
+
+S3_EVENT_PREFIX = os.getenv("S3_EVENT_PREFIX", "AWSLogs/")
+TAG_LIMIT = int(os.getenv("TAG_LIMIT", "50"))
+
+# If you want strict behavior, you can set this to false.
+EVICT_ACCA_ON_LIMIT = (os.getenv("EVICT_ACCA_ON_LIMIT", "true").lower() == "true")
+
+# Optional: avoid AWS service-linked role noise. Default: true.
+SKIP_SERVICE_LINKED_ROLES = (os.getenv("SKIP_SERVICE_LINKED_ROLES", "true").lower() == "true")
+
+# Comma-separated account IDs.
+ALLOWED_ACCOUNTS = set(
+    (os.getenv("ALLOWED_ACCOUNTS", "") or "").split(",")
+    if os.getenv("ALLOWED_ACCOUNTS")
+    else [
+        "[account_id]"
+    ]
+)
+
+MAX_POOL = int(os.getenv("MAX_POOL_CONNECTIONS", str(max(256, WORKERS * 8))))
+
+# IAM tag value max length
+TAG_VALUE_MAX = 256
+
+BOTO_CFG = Config(
+    retries={"max_attempts": 12, "mode": "adaptive"},
+    tcp_keepalive=True,
+    connect_timeout=5,
+    read_timeout=30,
+    max_pool_connections=MAX_POOL,
+    s3={"addressing_style": "virtual"},
+)
+
+_session = boto3.session.Session()
+S3_MAIN = _session.client("s3", config=BOTO_CFG)
+
+# STS client cache: (account_id, region) -> {"exp": datetime, "clients": {...}}
+_CLIENT_CACHE: Dict[Tuple[str, str], dict] = {}
+
+# =========================
+# Relevant events
+# =========================
+_RELEVANT: set[Tuple[str, str]] = {
+    ("ec2.amazonaws.com", "RunInstances"),
+    ("ec2.amazonaws.com", "CreateVpc"),
+    ("s3.amazonaws.com", "CreateBucket"),
+
+    ("iam.amazonaws.com", "CreateUser"),
+    ("iam.amazonaws.com", "CreateRole"),
+    ("iam.amazonaws.com", "TagRole"),
+    ("iam.amazonaws.com", "CreateAccessKey"),
+    ("iam.amazonaws.com", "DeleteAccessKey"),
+    ("iam.amazonaws.com", "CreateServiceSpecificCredential"),
+    ("iam.amazonaws.com", "DeleteServiceSpecificCredential"),
+    ("iam.amazonaws.com", "TagUser"),  # console “description” path
+
+    ("rds.amazonaws.com", "CreateDBInstance"),
+    ("rds.amazonaws.com", "CreateDBCluster"),
+    ("dynamodb.amazonaws.com", "CreateTable"),
+
+    # CloudFormation
+    ("cloudformation.amazonaws.com", "CreateStack"),
+    ("cloudformation.amazonaws.com", "UpdateStack"),
+
+    ("kms.amazonaws.com", "CreateKey"),
+    ("cloudfront.amazonaws.com", "CreateDistribution"),
+    ("cloudfront.amazonaws.com", "CreateDistributionWithTags"),
+    ("eks.amazonaws.com", "CreateCluster"),
+    ("sns.amazonaws.com", "CreateTopic"),
+    ("sqs.amazonaws.com", "CreateQueue"),
+    ("sagemaker.amazonaws.com", "CreateNotebookInstance"),
+
+    ("autoscaling.amazonaws.com", "CreateAutoScalingGroup"),
+
+    # Bedrock resources
+    ("bedrock.amazonaws.com", "CreateModelInvocationJob"),
+    ("bedrock.amazonaws.com", "CreateModelCustomizationJob"),
+    ("bedrock.amazonaws.com", "CreateProvisionedModelThroughput"),
+    ("bedrock.amazonaws.com", "CreateGuardrail"),
+    ("bedrock.amazonaws.com", "CreateAgent"),
+    ("bedrock.amazonaws.com", "CreateKnowledgeBase"),
+    ("bedrock.amazonaws.com", "CreateDataSource"),
+    ("bedrock.amazonaws.com", "CreateAgentActionGroup"),
+}
+
+def is_relevant(evt: dict) -> bool:
+    return (evt.get("eventSource"), evt.get("eventName")) in _RELEVANT
+
+def is_failed_event(evt: dict) -> bool:
+    return bool(evt.get("errorCode") or evt.get("errorMessage"))
+
+# =========================
+# Path helper
+# =========================
+def get_path(obj: Any, path: str) -> Any:
+    cur = obj
+    for p in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
+
+# =========================
+# EC2: skip Spot / ASG / EKS-managed instances
+# =========================
+def should_tag_ec2_instance(evt: dict) -> bool:
+    req = evt.get("requestParameters") or {}
+
+    # Skip Spot
+    if get_path(req, "instanceMarketOptions.marketType") == "spot":
+        return False
+
+    # Skip ASG-launched instances
+    if isinstance(req.get("autoScalingGroupName"), str) and req.get("autoScalingGroupName"):
+        return False
+
+    # Skip EKS-managed nodes
+    ui = evt.get("userIdentity") or {}
+    if ui.get("invokedBy") == "eks.amazonaws.com":
+        return False
+
+    if "eks" in (req.get("clientToken") or ""):
+        return False
+
+    return True
+
+# =========================
+# STS / cross-account
+# =========================
+def extract_account_and_region_from_key(key: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    parts = key.split("/")
+    try:
+        # AWSLogs/<OrgId>/<AccountId>/CloudTrail/<Region>/...
+        return parts[1], parts[2], parts[4]
+    except IndexError:
+        logger.error(f"❌ Failed parsing key: {key}")
+        return None, None, None
+
+def _cred_args(creds, region: Optional[str] = None) -> dict:
+    args = dict(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+    if region:
+        args["region_name"] = region
+    return args
+
+def assume_role(account_id: str, region: str) -> Optional[dict]:
+    now = datetime.now(timezone.utc)
+    cache_key = (account_id, region)
+    cached = _CLIENT_CACHE.get(cache_key)
+    if cached and cached["exp"] > now:
+        return cached["clients"]
+
+    role_arn = f"arn:aws:iam::{account_id}:role/{ROLE_NAME}"
+    logger.info(f"🔐 AssumeRole into {role_arn} (region={region})")
+
+    try:
+        sts = _session.client("sts", region_name=region, config=BOTO_CFG)
+        response = sts.assume_role(RoleArn=role_arn, RoleSessionName=ROLE_SESSION_NAME)
+    except ClientError as e:
+        logger.error(f"❌ AssumeRole failed: {e}")
+        return None
+
+    creds = response["Credentials"]
+
+    clients = {
+        "ec2": _session.client("ec2", **_cred_args(creds, region), config=BOTO_CFG),
+        "s3": _session.client("s3", **_cred_args(creds, region), config=BOTO_CFG),
+        # IAM is global; using us-east-1 avoids regional surprises
+        "iam": _session.client("iam", **_cred_args(creds, "us-east-1"), config=BOTO_CFG),
+        "rds": _session.client("rds", **_cred_args(creds, region), config=BOTO_CFG),
+        "ddb": _session.client("dynamodb", **_cred_args(creds, region), config=BOTO_CFG),
+        "cloudformation": _session.client("cloudformation", **_cred_args(creds, region), config=BOTO_CFG),
+        "kms": _session.client("kms", **_cred_args(creds, region), config=BOTO_CFG),
+        # CloudFront is global; using us-east-1
+        "cloudfront": _session.client("cloudfront", **_cred_args(creds, "us-east-1"), config=BOTO_CFG),
+        "eks": _session.client("eks", **_cred_args(creds, region), config=BOTO_CFG),
+        "sns": _session.client("sns", **_cred_args(creds, region), config=BOTO_CFG),
+        "sqs": _session.client("sqs", **_cred_args(creds, region), config=BOTO_CFG),
+        "sagemaker": _session.client("sagemaker", **_cred_args(creds, region), config=BOTO_CFG),
+        "autoscaling": _session.client("autoscaling", **_cred_args(creds, region), config=BOTO_CFG),
+        "bedrock": _session.client("bedrock", **_cred_args(creds, region), config=BOTO_CFG),
+        "bedrock_agent": _session.client("bedrock-agent", **_cred_args(creds, region), config=BOTO_CFG),
+    }
+
+    _CLIENT_CACHE[cache_key] = {"exp": creds["Expiration"], "clients": clients}
+    return clients
+
+# =========================
+# S3 Select + streaming fallback
+# =========================
+def _build_s3_select_where() -> str:
+    by_src: Dict[str, set] = {}
+    for src, name in _RELEVANT:
+        by_src.setdefault(src, set()).add(name)
+
+    clauses = []
+    for src, names in by_src.items():
+        name_list = ",".join(f"'{n}'" for n in sorted(names))
+        clauses.append(f"(s.eventSource = '{src}' AND s.eventName IN ({name_list}))")
+    return " OR ".join(clauses)
+
+def iter_relevant_events_via_s3_select(bucket: str, key: str):
+    sql = f"""
+    SELECT s.eventSource, s.eventName,
+           s.userIdentity,
+           s.eventTime, s.requestParameters, s.responseElements, s.resources, s.errorCode, s.errorMessage
+    FROM S3Object[*].Records[*] s
+    WHERE {_build_s3_select_where()}
+    """
+    try:
+        resp = S3_MAIN.select_object_content(
+            Bucket=bucket,
+            Key=key,
+            ExpressionType="SQL",
+            Expression=sql,
+            InputSerialization={"JSON": {"Type": "DOCUMENT"}, "CompressionType": "GZIP"},
+            OutputSerialization={"JSON": {"RecordDelimiter": "\n"}},
+        )
+    except ClientError as e:
+        logger.info(f"ℹ️ S3 Select unavailable, falling back. {e}")
+        return None
+
+    buf = b""
+    for event in resp.get("Payload", []):
+        if "Records" in event:
+            buf += event["Records"]["Payload"]
+            *lines, buf = buf.split(b"\n")
+            for line in lines:
+                if not line:
+                    continue
+                row = json.loads(line)
+                yield {
+                    "eventSource": row.get("eventSource"),
+                    "eventName": row.get("eventName"),
+                    "userIdentity": row.get("userIdentity") or {"arn": None},
+                    "eventTime": row.get("eventTime"),
+                    "requestParameters": row.get("requestParameters"),
+                    "responseElements": row.get("responseElements"),
+                    "resources": row.get("resources") or [],
+                    "errorCode": row.get("errorCode"),
+                    "errorMessage": row.get("errorMessage"),
+                }
+        elif "End" in event:
+            break
+
+def iter_relevant_events_streaming(bucket: str, key: str):
+    obj = S3_MAIN.get_object(Bucket=bucket, Key=key)
+    dec = JSONDecoder()
+    with gzip.GzipFile(fileobj=obj["Body"]) as gz:
+        reader = io.TextIOWrapper(gz, encoding="utf-8")
+        chunk_iter = iter(lambda: reader.read(128 * 1024), "")
+        buf = ""
+
+        # Seek to Records array start
+        while True:
+            try:
+                chunk = next(chunk_iter)
+            except StopIteration:
+                return
+            buf += chunk
+            idx = buf.find('"Records"')
+            if idx == -1:
+                buf = buf[-20:]
+                continue
+            lb = buf.find("[", idx)
+            if lb == -1:
+                buf = buf[max(idx - 2, 0):]
+                continue
+            buf = buf[lb + 1:]
+            break
+
+        i = 0
+        while True:
+            while i >= len(buf):
+                try:
+                    buf += next(chunk_iter)
+                except StopIteration:
+                    return
+
+            while i < len(buf) and buf[i] in " \r\n\t,":
+                i += 1
+                if i >= len(buf):
+                    try:
+                        buf += next(chunk_iter)
+                    except StopIteration:
+                        return
+
+            if buf[i:i+1] == "]":
+                return
+
+            try:
+                obj_evt, end = dec.raw_decode(buf, i)
+            except json.JSONDecodeError:
+                try:
+                    buf += next(chunk_iter)
+                    continue
+                except StopIteration:
+                    return
+
+            i = end
+            if is_relevant(obj_evt):
+                yield obj_evt
+
+# =========================
+# Tag helpers
+# =========================
+IAM_ALLOWED_VALUE_RE = re.compile(r"[^0-9A-Za-z_.:/=+\-@ ]+")
+
+def sanitize_iam_tag_value(v: Any) -> str:
+    if v is None:
+        return ""
+    if not isinstance(v, str):
+        v = str(v)
+    v = IAM_ALLOWED_VALUE_RE.sub("", v)
+    v = v.strip()
+    return v[:TAG_VALUE_MAX]
+
+def filter_add_only(existing_list: List[Dict[str, str]], new_list: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    existing_keys = {t.get("Key") for t in (existing_list or []) if "Key" in t}
+    return [t for t in (new_list or []) if t.get("Key") not in existing_keys]
+
+def enforce_tag_limit(existing_count: int, tags_to_add: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    if existing_count >= TAG_LIMIT:
+        return []
+    room = TAG_LIMIT - existing_count
+    return tags_to_add[:room]
+
+def append_once(current: str, addition: str, sep: str = " / ") -> str:
+    current = (current or "").strip()
+    addition = (addition or "").strip()
+    if not addition:
+        return sanitize_iam_tag_value(current)
+    if not current:
+        return sanitize_iam_tag_value(addition)
+    if addition in current:
+        return sanitize_iam_tag_value(current)
+    return sanitize_iam_tag_value(f"{current}{sep}{addition}")
+
+# =========================
+# created_by extraction + automation actor detection
+# =========================
+def _extract_best_actor(evt: dict) -> str:
+    ui = evt.get("userIdentity") or {}
+
+    v = ui.get("userName")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+
+    arn = ui.get("arn")
+    if isinstance(arn, str) and arn.strip():
+        parts = arn.split("/")
+        if parts and parts[-1].strip():
+            return parts[-1].strip()
+
+    pid = ui.get("principalId")
+    if isinstance(pid, str) and pid.strip():
+        if ":" in pid:
+            tail = pid.split(":")[-1].strip()
+            if tail:
+                return tail
+        return pid.strip()
+
+    issuer_arn = (((ui.get("sessionContext") or {}).get("sessionIssuer") or {}).get("arn"))
+    if isinstance(issuer_arn, str) and issuer_arn.strip():
+        last = issuer_arn.split("/")[-1].strip()
+        if last:
+            return last
+
+    return "unknown"
+
+def is_automation_actor(evt: dict) -> bool:
+    """
+    Avoid reacting to our own TagUser/TagRole calls that would otherwise append created_by=TaggerSession.
+    """
+    ui = evt.get("userIdentity") or {}
+    arn = ui.get("arn") or ""
+    if isinstance(arn, str) and f":assumed-role/{ROLE_NAME}/" in arn:
+        return True
+
+    issuer_arn = (((ui.get("sessionContext") or {}).get("sessionIssuer") or {}).get("arn")) or ""
+    if isinstance(issuer_arn, str) and issuer_arn.endswith(f":role/{ROLE_NAME}"):
+        return True
+
+    actor = _extract_best_actor(evt)
+    if actor == ROLE_SESSION_NAME:
+        return True
+
+    return False
+
+# =========================
+# IAM helpers (Users, Roles, Keys)
+# =========================
+ACCESS_KEY_TAG_RE = re.compile(r"^(AKIA|ASIA)[A-Z0-9]{16}$")
+SERVICE_SPEC_TAG_RE = re.compile(r"^ACCA[A-Z0-9]{16,}$")
+
+def looks_like_access_key_id(k: str) -> bool:
+    return isinstance(k, str) and bool(ACCESS_KEY_TAG_RE.match(k))
+
+def looks_like_service_specific_cred_id(k: str) -> bool:
+    return isinstance(k, str) and bool(SERVICE_SPEC_TAG_RE.match(k))
+
+def looks_like_key_tag(k: str) -> bool:
+    return looks_like_access_key_id(k) or looks_like_service_specific_cred_id(k)
+
+def iam_list_user_tags(iam_client, user_name: str) -> List[Dict[str, str]]:
+    try:
+        return iam_client.list_user_tags(UserName=user_name).get("Tags", []) or []
+    except ClientError:
+        return []
+
+def iam_tag_user(iam_client, user_name: str, tags: List[Dict[str, str]]) -> None:
+    if tags:
+        iam_client.tag_user(UserName=user_name, Tags=tags)
+
+def iam_remove_user_tag_key(iam_client, user_name: str, key: str) -> None:
+    if not user_name or not key:
+        return
+    try:
+        iam_client.untag_user(UserName=user_name, TagKeys=[key])
+        logger.info(f"🧹 [IAM remove] user={user_name} key={key}")
+    except ClientError as e:
+        if "NoSuchEntity" in str(e):
+            logger.info(f"ℹ️ [IAM remove] NoSuchEntity user={user_name}; ignoring.")
+            return
+        logger.error(f"❌ untag_user failed user={user_name} key={key}: {e}")
+
+def iam_add_standard_user_tags_add_only(iam_client, user_name: str, base_tags: List[Dict[str, str]]) -> None:
+    existing = iam_list_user_tags(iam_client, user_name)
+    to_add = filter_add_only(existing, base_tags)
+    to_add = enforce_tag_limit(len(existing), to_add)
+    if to_add:
+        iam_tag_user(iam_client, user_name, to_add)
+
+def iam_list_role_tags(iam_client, role_name: str) -> List[Dict[str, str]]:
+    try:
+        return iam_client.list_role_tags(RoleName=role_name).get("Tags", []) or []
+    except ClientError:
+        return []
+
+def iam_tag_role(iam_client, role_name: str, tags: List[Dict[str, str]]) -> None:
+    if tags:
+        iam_client.tag_role(RoleName=role_name, Tags=tags)
+
+def iam_add_standard_role_tags_add_only(iam_client, role_name: str, base_tags: List[Dict[str, str]]) -> None:
+    existing = iam_list_role_tags(iam_client, role_name)
+    to_add = filter_add_only(existing, base_tags)
+    to_add = enforce_tag_limit(len(existing), to_add)
+    if to_add:
+        iam_tag_role(iam_client, role_name, to_add)
+
+def iam_cleanup_orphan_access_key_tags(iam_client, user_name: str) -> None:
+    """
+    Authoritative cleanup for AKIA/ASIA tag keys (safe).
+    Requires iam:ListAccessKeys + iam:UntagUser on the assumed role.
+    """
+    try:
+        paginator = iam_client.get_paginator("list_access_keys")
+        live = set()
+        for page in paginator.paginate(UserName=user_name):
+            for meta in page.get("AccessKeyMetadata", []) or []:
+                akid = meta.get("AccessKeyId")
+                if isinstance(akid, str) and akid:
+                    live.add(akid)
+
+        tags = iam_list_user_tags(iam_client, user_name)
+        for t in tags:
+            k = t.get("Key") or ""
+            if looks_like_access_key_id(k) and k not in live:
+                iam_remove_user_tag_key(iam_client, user_name, k)
+    except ClientError as e:
+        if "NoSuchEntity" in str(e):
+            return
+        logger.error(f"❌ orphan access-key cleanup failed user={user_name}: {e}")
+
+def iam_evict_one_accc_tag_if_needed(iam_client, user_name: str) -> bool:
+    """
+    Best-effort: if we hit the 50-tag limit due to missing DeleteServiceSpecificCredential events,
+    evict ONE ACCA* tag key (only ACCA, never business tags) to free room.
+    """
+    if not EVICT_ACCA_ON_LIMIT:
+        return False
+
+    tags = iam_list_user_tags(iam_client, user_name)
+    acca_keys = sorted([t.get("Key") for t in tags if looks_like_service_specific_cred_id(t.get("Key") or "")])
+
+    if not acca_keys:
+        return False
+
+    victim = acca_keys[0]  # deterministic
+    iam_remove_user_tag_key(iam_client, user_name, victim)
+    logger.warning(f"⚠️ [IAM] Evicted ACCA tag key={victim} for user={user_name} to free tag capacity")
+    return True
+
+def iam_append_created_by_for_key_tag(iam_client, user_name: str, key: str, actor: str) -> None:
+    """
+    Append-only on the *credential-id tag key* (AKIA/ASIA/ACCA):
+      - ensure created_by=... exists in the VALUE
+      - DO NOT append created_time=... (per your request)
+    """
+    if not user_name or not key:
+        return
+
+    actor = sanitize_iam_tag_value(actor) or "unknown"
+    suffix = f"created_by={actor}"
+
+    existing = iam_list_user_tags(iam_client, user_name)
+    existing_map = {t.get("Key"): (t.get("Value") or "") for t in existing if "Key" in t}
+
+    # Need room for a new key?
+    if key not in existing_map and len(existing_map) >= TAG_LIMIT:
+        if looks_like_access_key_id(key):
+            iam_cleanup_orphan_access_key_tags(iam_client, user_name)
+            existing = iam_list_user_tags(iam_client, user_name)
+            existing_map = {t.get("Key"): (t.get("Value") or "") for t in existing if "Key" in t}
+        elif looks_like_service_specific_cred_id(key):
+            iam_evict_one_accc_tag_if_needed(iam_client, user_name)
+            existing = iam_list_user_tags(iam_client, user_name)
+            existing_map = {t.get("Key"): (t.get("Value") or "") for t in existing if "Key" in t}
+
+    if key not in existing_map and len(existing_map) >= TAG_LIMIT:
+        logger.warning(f"⚠️ [IAM] Tag limit reached for user={user_name}; cannot add key={key}")
+        return
+
+    cur_val = existing_map.get(key, "")
+
+    # Don’t append if already present (any created_by)
+    if "created_by=" in cur_val:
+        return
+
+    new_val = append_once(cur_val, suffix, sep=" / ")
+    if new_val == cur_val:
+        return
+
+    try:
+        iam_tag_user(iam_client, user_name, [{"Key": key, "Value": new_val}])
+        logger.info(f"🏷️ [IAM key-tag append] user={user_name} key={key} value={new_val}")
+    except ClientError as e:
+        logger.error(f"❌ TagUser failed user={user_name} key={key}: {e}")
+
+def parse_tags_from_request(req: dict) -> List[Dict[str, str]]:
+    """
+    CloudTrail shapes:
+      requestParameters.tags: [{"key":"..","value":".."}, ...]
+      requestParameters.tags: [{"Key":"..","Value":".."}, ...]
+      requestParameters.tags: {"key":"..","value":".."}
+    """
+    tags = (req or {}).get("tags")
+    if isinstance(tags, dict):
+        k = tags.get("key") or tags.get("Key")
+        v = tags.get("value") or tags.get("Value")
+        if isinstance(k, str):
+            return [{"Key": k, "Value": str(v or "")}]
+        return []
+
+    if not isinstance(tags, list):
+        return []
+
+    out: List[Dict[str, str]] = []
+    for t in tags:
+        if not isinstance(t, dict):
+            continue
+        k = t.get("key") or t.get("Key")
+        v = t.get("value") or t.get("Value")
+        if isinstance(k, str):
+            out.append({"Key": k, "Value": str(v or "")})
+    return out
+
+# =========================
+# Bedrock helpers
+# =========================
+def _find_first_arn(obj: Any) -> str:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and ("arn" in k.lower()):
+                if isinstance(v, str) and v.startswith("arn:aws:"):
+                    return v
+            found = _find_first_arn(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_first_arn(item)
+            if found:
+                return found
+    return ""
+
+def tag_bedrock_best_effort(clients: dict, evt: dict, tags_kv: Dict[str, str]) -> None:
+    arn = ""
+
+    resources = evt.get("resources") or []
+    if isinstance(resources, list):
+        for r in resources:
+            if isinstance(r, dict):
+                cand = r.get("ARN") or r.get("arn") or r.get("resourceARN") or r.get("resourceArn")
+                if isinstance(cand, str) and cand.startswith("arn:aws:"):
+                    arn = cand
+                    break
+
+    if not arn:
+        arn = _find_first_arn(evt.get("responseElements") or {}) or _find_first_arn(evt)
+
+    if not arn:
+        logger.info(f"ℹ️ [Bedrock] No ARN found for {evt.get('eventSource')}:{evt.get('eventName')}; skipping.")
+        return
+
+    try:
+        # Knowledge Bases live under bedrock:...:knowledge-base/<id>
+        # Tagging for KB must go via bedrock-agent TagResource
+        if ":knowledge-base/" in arn:
+            clients["bedrock_agent"].tag_resource(
+                resourceArn=arn,
+                tags={k: sanitize_iam_tag_value(v) for k, v in tags_kv.items()},
+            )
+            logger.info(f"🏷️ [Bedrock KB] tagged {arn}")
+            return
+
+        # Everything else stays on bedrock TagResource
+        clients["bedrock"].tag_resource(
+            resourceARN=arn,
+            tags=[{"key": k, "value": sanitize_iam_tag_value(v)} for k, v in tags_kv.items()],
+        )
+        logger.info(f"🏷️ [Bedrock] tagged {arn}")
+
+    except ClientError as e:
+        logger.error(f"❌ [Bedrock] tag_resource failed for {arn}: {e}")
+
+# =========================
+# Resource mappings (other services)
+# =========================
+RESOURCE_MAPPINGS: Dict[Tuple[str, str], dict] = {
+    ("ec2.amazonaws.com", "RunInstances"): {
+        "service": "ec2",
+        "type": "list",
+        "list_path": "responseElements.instancesSet.items",
+        "id_key": "instanceId",
+    },
+    ("ec2.amazonaws.com", "CreateVpc"): {
+        "service": "ec2",
+        "type": "single",
+        "paths": ["responseElements.vpc.vpcId", "responseElements.vpcId"],
+    },
+    ("s3.amazonaws.com", "CreateBucket"): {
+        "service": "s3",
+        "type": "single",
+        "paths": ["requestParameters.bucketName"],
+    },
+    ("rds.amazonaws.com", "CreateDBInstance"): {
+        "service": "rds",
+        "type": "single",
+        "paths": ["responseElements.dBInstanceArn", "responseElements.dBInstance.dBInstanceArn"],
+    },
+    ("rds.amazonaws.com", "CreateDBCluster"): {
+        "service": "rds",
+        "type": "single",
+        "paths": ["responseElements.dBClusterArn", "responseElements.dBCluster.dBClusterArn"],
+    },
+    ("dynamodb.amazonaws.com", "CreateTable"): {
+        "service": "ddb",
+        "type": "single",
+        "paths": ["responseElements.tableDescription.tableArn"],
+    },
+    ("kms.amazonaws.com", "CreateKey"): {
+        "service": "kms",
+        "type": "single",
+        "paths": ["responseElements.keyMetadata.keyId", "responseElements.keyMetadata.arn"],
+    },
+    ("cloudfront.amazonaws.com", "CreateDistribution"): {
+        "service": "cloudfront",
+        "type": "single",
+        "paths": ["responseElements.distribution.ARN", "responseElements.distribution.arn", "responseElements.distribution.aRN"],
+        "id_fallback_paths": ["responseElements.distribution.Id", "responseElements.distribution.id"],
+    },
+    ("cloudfront.amazonaws.com", "CreateDistributionWithTags"): {
+        "service": "cloudfront",
+        "type": "single",
+        "paths": ["responseElements.distribution.ARN", "responseElements.distribution.arn", "responseElements.distribution.aRN"],
+        "id_fallback_paths": ["responseElements.distribution.Id", "responseElements.distribution.id"],
+    },
+    ("eks.amazonaws.com", "CreateCluster"): {
+        "service": "eks",
+        "type": "single",
+        "paths": ["responseElements.cluster.arn", "responseElements.clusterArn"],
+    },
+    ("sns.amazonaws.com", "CreateTopic"): {
+        "service": "sns",
+        "type": "single",
+        "paths": ["responseElements.topicArn"],
+    },
+    ("sqs.amazonaws.com", "CreateQueue"): {
+        "service": "sqs",
+        "type": "single",
+        "paths": ["responseElements.queueUrl"],
+    },
+    ("sagemaker.amazonaws.com", "CreateNotebookInstance"): {
+        "service": "sagemaker",
+        "type": "single",
+        "paths": ["responseElements.notebookInstanceArn"],
+    },
+    ("autoscaling.amazonaws.com", "CreateAutoScalingGroup"): {
+        "service": "autoscaling",
+        "type": "single",
+        "paths": ["requestParameters.autoScalingGroupName"],
+    },
+}
+
+def extract_resource_ids_for_mapping(evt: dict, account_id: str) -> List[str]:
+    cfg = RESOURCE_MAPPINGS.get((evt.get("eventSource"), evt.get("eventName")))
+    if not cfg:
+        return []
+
+    if cfg["type"] == "list":
+        items = get_path(evt, cfg["list_path"])
+        if not isinstance(items, list):
+            return []
+        out: List[str] = []
+        for it in items:
+            if isinstance(it, dict):
+                rid = it.get(cfg["id_key"])
+                if isinstance(rid, str) and rid:
+                    out.append(rid)
+        return out
+
+    for p in cfg.get("paths", []):
+        v = get_path(evt, p)
+        if isinstance(v, str) and v:
+            return [v]
+
+    if cfg["service"] == "cloudfront":
+        dist_id = ""
+        for p in cfg.get("id_fallback_paths", []):
+            v = get_path(evt, p)
+            if isinstance(v, str) and v:
+                dist_id = v
+                break
+        if dist_id and account_id:
+            return [f"arn:aws:cloudfront::{account_id}:distribution/{dist_id}"]
+
+    return []
+
+# =========================
+# Service add-only taggers
+# =========================
+def apply_add_only_tags(clients: dict, service: str, rid: str, tags: List[Dict[str, str]], account_id: str) -> None:
+    if not rid or not tags:
+        return
+
+    try:
+        if service == "ec2":
+            resp = clients["ec2"].describe_tags(Filters=[{"Name": "resource-id", "Values": [rid]}])
+            existing = [{"Key": t["Key"], "Value": t.get("Value", "")} for t in (resp.get("Tags") or [])]
+            to_add = enforce_tag_limit(len(existing), filter_add_only(existing, tags))
+            if to_add:
+                clients["ec2"].create_tags(Resources=[rid], Tags=to_add)
+
+        elif service == "s3":
+            try:
+                cur = clients["s3"].get_bucket_tagging(Bucket=rid).get("TagSet", []) or []
+            except ClientError as e:
+                if "NoSuchTagSet" in str(e):
+                    cur = []
+                elif "NoSuchBucket" in str(e):
+                    return
+                else:
+                    raise
+            to_add = enforce_tag_limit(len(cur), filter_add_only(cur, tags))
+            if to_add:
+                clients["s3"].put_bucket_tagging(Bucket=rid, Tagging={"TagSet": cur + to_add})
+
+        elif service == "rds":
+            cur = clients["rds"].list_tags_for_resource(ResourceName=rid).get("TagList", []) or []
+            existing = [{"Key": t["Key"], "Value": t.get("Value", "")} for t in cur]
+            to_add = enforce_tag_limit(len(existing), filter_add_only(existing, tags))
+            if to_add:
+                clients["rds"].add_tags_to_resource(ResourceName=rid, Tags=to_add)
+
+        elif service == "ddb":
+            cur = clients["ddb"].list_tags_of_resource(ResourceArn=rid).get("Tags", []) or []
+            existing = [{"Key": t["Key"], "Value": t.get("Value", "")} for t in cur]
+            to_add = enforce_tag_limit(len(existing), filter_add_only(existing, tags))
+            if to_add:
+                clients["ddb"].tag_resource(ResourceArn=rid, Tags=to_add)
+
+        elif service == "kms":
+            cur = clients["kms"].list_resource_tags(KeyId=rid).get("Tags", []) or []
+            existing = [{"Key": t["TagKey"], "Value": t.get("TagValue", "")} for t in cur]
+            to_add = enforce_tag_limit(len(existing), filter_add_only(existing, tags))
+            if to_add:
+                clients["kms"].tag_resource(
+                    KeyId=rid,
+                    Tags=[{"TagKey": t["Key"], "TagValue": t["Value"]} for t in to_add],
+                )
+
+        elif service == "cloudfront":
+            resp = clients["cloudfront"].list_tags_for_resource(Resource=rid)
+            cur = (((resp.get("Tags") or {}).get("Items")) or [])
+            existing = [{"Key": t["Key"], "Value": t.get("Value", "")} for t in cur]
+            to_add = enforce_tag_limit(len(existing), filter_add_only(existing, tags))
+            if to_add:
+                clients["cloudfront"].tag_resource(Resource=rid, Tags={"Items": to_add})
+
+        elif service == "eks":
+            cur = clients["eks"].list_tags_for_resource(resourceArn=rid).get("tags", {}) or {}
+            if len(cur) < TAG_LIMIT:
+                to_add = {t["Key"]: t["Value"] for t in tags if t["Key"] not in cur}
+                room = TAG_LIMIT - len(cur)
+                to_add = dict(list(to_add.items())[:room])
+                if to_add:
+                    clients["eks"].tag_resource(resourceArn=rid, tags=to_add)
+
+        elif service == "sns":
+            cur = clients["sns"].list_tags_for_resource(ResourceArn=rid).get("Tags", []) or []
+            existing = [{"Key": t["Key"], "Value": t.get("Value", "")} for t in cur]
+            to_add = enforce_tag_limit(len(existing), filter_add_only(existing, tags))
+            if to_add:
+                clients["sns"].tag_resource(ResourceArn=rid, Tags=to_add)
+
+        elif service == "sqs":
+            cur = clients["sqs"].list_queue_tags(QueueUrl=rid).get("Tags", {}) or {}
+            if len(cur) < TAG_LIMIT:
+                to_add = {t["Key"]: t["Value"] for t in tags if t["Key"] not in cur}
+                room = TAG_LIMIT - len(cur)
+                to_add = dict(list(to_add.items())[:room])
+                if to_add:
+                    clients["sqs"].tag_queue(QueueUrl=rid, Tags=to_add)
+
+        elif service == "sagemaker":
+            cur = clients["sagemaker"].list_tags(ResourceArn=rid).get("Tags", []) or []
+            existing = [{"Key": t["Key"], "Value": t.get("Value", "")} for t in cur]
+            to_add = enforce_tag_limit(len(existing), filter_add_only(existing, tags))
+            if to_add:
+                clients["sagemaker"].add_tags(ResourceArn=rid, Tags=to_add)
+
+        elif service == "autoscaling":
+            cur = clients["autoscaling"].describe_tags(
+                Filters=[{"Name": "auto-scaling-group", "Values": [rid]}]
+            ).get("Tags", []) or []
+            existing = [{"Key": t["Key"], "Value": t.get("Value", "")} for t in cur]
+            to_add = enforce_tag_limit(len(existing), filter_add_only(existing, tags))
+            if to_add:
+                clients["autoscaling"].create_or_update_tags(
+                    Tags=[
+                        {
+                            "ResourceId": rid,
+                            "ResourceType": "auto-scaling-group",
+                            "Key": t["Key"],
+                            "Value": t["Value"],
+                            "PropagateAtLaunch": True,
+                        }
+                        for t in to_add
+                    ]
+                )
+
+    except ClientError as e:
+        logger.error(f"❌ [{service}] tagging failed rid={rid}: {e}")
+
+# =========================
+# CloudFormation: add-only stack tagging (NEW)
+# =========================
+def tag_cfn_stack_add_only(cfn_client, stack_id_or_arn: str, tags: List[Dict[str, str]]) -> None:
+    """
+    Add-only tagging for CloudFormation stacks.
+    CloudFormation requires UpdateStack with full tag set (merged).
+    """
+    if not stack_id_or_arn or not tags:
+        return
+
+    try:
+        stacks = cfn_client.describe_stacks(StackName=stack_id_or_arn).get("Stacks", []) or []
+        if not stacks:
+            return
+
+        existing = stacks[0].get("Tags", []) or []
+        to_add = filter_add_only(existing, tags)
+        to_add = enforce_tag_limit(len(existing), to_add)
+        if not to_add:
+            return
+
+        merged = existing + to_add
+
+        cfn_client.update_stack(
+            StackName=stack_id_or_arn,
+            UsePreviousTemplate=True,
+            Tags=merged,
+            Capabilities=["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
+        )
+        logger.info(f"🏷️ [CFN add-only] stack={stack_id_or_arn} -> {to_add}")
+
+    except ClientError as e:
+        msg = str(e)
+        if "No updates are to be performed" in msg:
+            logger.info(f"ℹ️ [CFN] No updates for stack={stack_id_or_arn}")
+            return
+        logger.error(f"❌ [CFN] update_stack failed stack={stack_id_or_arn}: {e}")
+
+# =========================
+# Envelopes (SNS/SQS/S3)
+# =========================
+def safe_json_loads(s: Any) -> Any:
+    if isinstance(s, (dict, list)):
+        return s
+    try:
+        return json.loads(s)
+    except Exception:
+        return s
+
+def unwrap_sns_if_needed(body: Any) -> Any:
+    if isinstance(body, dict) and body.get("Type") == "Notification" and "Message" in body:
+        return safe_json_loads(body["Message"])
+    return body
+
+def idempotency_key(record: Dict[str, Any]) -> str:
+    if "messageId" in record:  # SQS
+        raw = record.get("body", "")
+        h = hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
+        return f"{record['messageId']}:{h}"
+    if "Sns" in record:  # SNS
+        mid = record["Sns"].get("MessageId", "no-id")
+        raw = record["Sns"].get("Message", "")
+        h = hashlib.sha256((raw or "").encode("utf-8")).hexdigest()
+        return f"{mid}:{h}"
+    if "s3" in record:  # direct S3
+        key = record["s3"]["object"].get("key", "")
+        return f"s3:{hashlib.sha256(key.encode()).hexdigest()}"
+    return "unknown"
+
+def s3_records_from_any(record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if "Sns" in record:
+        msg = record["Sns"].get("Message", "{}")
+        payload = safe_json_loads(msg)
+        if isinstance(payload, dict) and "Records" in payload:
+            return payload.get("Records") or []
+        return []
+
+    if "body" in record:
+        body = safe_json_loads(record["body"])
+        body = unwrap_sns_if_needed(body)
+        if isinstance(body, dict) and "Records" in body:
+            return body.get("Records") or []
+        if isinstance(body, dict) and "s3" in body:
+            return [body]
+        return []
+
+    if "s3" in record:
+        return [record]
+
+    return []
+
+# =========================
+# Core event processing
+# =========================
+def process_single_cloudtrail_event(clients: dict, evt: dict, account_id: str) -> None:
+    if is_failed_event(evt):
+        return
+
+    source = evt.get("eventSource") or ""
+    event_name = evt.get("eventName") or ""
+
+    # Skip ephemeral EC2 cases but keep CLI/UI/human coverage
+    if source == "ec2.amazonaws.com" and event_name == "RunInstances":
+        if not should_tag_ec2_instance(evt):
+            return
+
+    created_by_raw = _extract_best_actor(evt)
+    created_by = sanitize_iam_tag_value(created_by_raw) or "unknown"
+    created_time = sanitize_iam_tag_value(evt.get("eventTime", ""))
+
+    base_tags = [
+        {"Key": "created_by", "Value": created_by},
+        {"Key": "created_time", "Value": created_time},
+        {"Key": "autotag", "Value": "true"},
+    ]
+
+    # -------------------------
+    # CloudFormation stacks (ENABLED)
+    # -------------------------
+    if source == "cloudformation.amazonaws.com" and event_name in ("CreateStack", "UpdateStack"):
+        stack_id = get_path(evt, "responseElements.stackId")
+        stack_name = get_path(evt, "requestParameters.stackName")
+        target = stack_id or stack_name
+        if not target:
+            logger.info(f"ℹ️ [CFN] {event_name} missing stack identifier; skipping.")
+            return
+        tag_cfn_stack_add_only(clients["cloudformation"], target, base_tags)
+        return
+
+    # -------------------------
+    # IAM: Users / Roles / Keys
+    # -------------------------
+    if source == "iam.amazonaws.com":
+        iam_client = clients["iam"]
+        req = evt.get("requestParameters") or {}
+        relem = evt.get("responseElements") or {}
+
+        # CreateUser
+        if event_name == "CreateUser":
+            user_name = ""
+            if isinstance(relem, dict):
+                u = relem.get("user")
+                if isinstance(u, dict):
+                    user_name = u.get("userName") or ""
+            user_name = user_name or req.get("userName") or ""
+            if user_name:
+                iam_add_standard_user_tags_add_only(iam_client, user_name, base_tags)
+            return
+
+        # CreateRole (add-only)
+        if event_name == "CreateRole":
+            role_name = ""
+            if isinstance(relem, dict):
+                r = relem.get("role")
+                if isinstance(r, dict):
+                    role_name = r.get("roleName") or ""
+            role_name = role_name or req.get("roleName") or ""
+
+            role_path = req.get("path") or ""
+            if SKIP_SERVICE_LINKED_ROLES and isinstance(role_path, str) and "aws-service-role" in role_path:
+                return
+
+            if role_name:
+                iam_add_standard_role_tags_add_only(iam_client, role_name, base_tags)
+            return
+
+        # TagRole: ensure standard tags exist (add-only), and don't loop on ourselves
+        if event_name == "TagRole":
+            if is_automation_actor(evt):
+                return
+
+            role_name = req.get("roleName") or ""
+            if not role_name:
+                return
+
+            iam_add_standard_role_tags_add_only(iam_client, role_name, base_tags)
+            return
+
+        # CreateAccessKey
+        if event_name == "CreateAccessKey":
+            access_key_id = ""
+            user_name = ""
+
+            if isinstance(relem, dict):
+                ak = relem.get("accessKey") or {}
+                if isinstance(ak, dict):
+                    access_key_id = ak.get("accessKeyId") or ""
+                    user_name = ak.get("userName") or ""
+
+            user_name = user_name or req.get("userName") or (evt.get("userIdentity") or {}).get("userName") or ""
+            if user_name:
+                iam_add_standard_user_tags_add_only(iam_client, user_name, base_tags)
+            if user_name and access_key_id:
+                iam_append_created_by_for_key_tag(iam_client, user_name, access_key_id, created_by_raw)
+            return
+
+        # DeleteAccessKey
+        if event_name == "DeleteAccessKey":
+            user_name = req.get("userName") or (evt.get("userIdentity") or {}).get("userName") or ""
+            access_key_id = req.get("accessKeyId") or ""
+            if user_name and access_key_id:
+                iam_remove_user_tag_key(iam_client, user_name, access_key_id)
+                iam_cleanup_orphan_access_key_tags(iam_client, user_name)
+            return
+
+        # CreateServiceSpecificCredential (ACCA...)
+        if event_name == "CreateServiceSpecificCredential":
+            user_name = req.get("userName") or ""
+            cred_id = ""
+            if isinstance(relem, dict):
+                ssc = relem.get("serviceSpecificCredential") or {}
+                if isinstance(ssc, dict):
+                    cred_id = ssc.get("serviceSpecificCredentialId") or ""
+            if user_name:
+                iam_add_standard_user_tags_add_only(iam_client, user_name, base_tags)
+            if user_name and cred_id:
+                iam_append_created_by_for_key_tag(iam_client, user_name, cred_id, created_by_raw)
+            return
+
+        # DeleteServiceSpecificCredential
+        if event_name == "DeleteServiceSpecificCredential":
+            user_name = req.get("userName") or ""
+            cred_id = req.get("serviceSpecificCredentialId") or ""
+            if user_name and cred_id:
+                iam_remove_user_tag_key(iam_client, user_name, cred_id)
+            return
+
+        # TagUser (console sets "Description" on credentials -> TagUser)
+        if event_name == "TagUser":
+            if is_automation_actor(evt):
+                return
+
+            user_name = req.get("userName") or ""
+            if not user_name:
+                return
+
+            # Ensure standard tags exist (add-only)
+            iam_add_standard_user_tags_add_only(iam_client, user_name, base_tags)
+
+            tagged = parse_tags_from_request(req)
+            if not tagged:
+                return
+
+            # If user tagged the key-id itself (AKIA/ASIA/ACCA), append created_by only
+            for t in tagged:
+                k = t.get("Key") or ""
+                if looks_like_key_tag(k):
+                    iam_append_created_by_for_key_tag(iam_client, user_name, k, created_by_raw)
+            return
+
+        return  # other IAM events ignored
+
+    # -------------------------
+    # Bedrock resources (best effort)
+    # -------------------------
+    if source in ("bedrock.amazonaws.com", "bedrock-agent.amazonaws.com"):
+        tag_bedrock_best_effort(
+            clients,
+            evt,
+            {"created_by": created_by_raw, "created_time": evt.get("eventTime", ""), "autotag": "true"},
+        )
+        return
+
+    # -------------------------
+    # Other mapped services
+    # -------------------------
+    cfg = RESOURCE_MAPPINGS.get((source, event_name))
+    if not cfg:
+        return
+
+    ids = extract_resource_ids_for_mapping(evt, account_id=account_id)
+    if not ids:
+        return
+
+    for rid in ids:
+        apply_add_only_tags(clients, cfg["service"], rid, base_tags, account_id=account_id)
+
+def process_s3_record(s3_record: Dict[str, Any]) -> None:
+    rec_s3 = s3_record.get("s3") or {}
+    obj = rec_s3.get("object") or {}
+    key_enc = obj.get("key")
+    if not key_enc:
+        return
+
+    key = unquote_plus(key_enc)
+    if ORG_ID not in key or not key.startswith(S3_EVENT_PREFIX):
+        return
+
+    _, account_id, region = extract_account_and_region_from_key(key)
+    if not account_id or account_id not in ALLOWED_ACCOUNTS:
+        return
+
+    bucket = rec_s3.get("bucket", {}).get("name")
+    if not bucket:
+        return
+
+    events_iter = iter_relevant_events_via_s3_select(bucket, key)
+    if events_iter is None:
+        events_iter = iter_relevant_events_streaming(bucket, key)
+
+    clients = None
+    for evt in events_iter:
+        if clients is None:
+            clients = assume_role(account_id, region)
+            if not clients:
+                raise RuntimeError(f"AssumeRole failed for acct={account_id} region={region}")
+
+        try:
+            process_single_cloudtrail_event(clients, evt, account_id=account_id)
+        except (ClientError, EndpointConnectionError, ConnectionClosedError, ReadTimeoutError) as e:
+            logger.error(f"❌ Tagging failed for {evt.get('eventSource')}:{evt.get('eventName')}: {e}")
+        except Exception as e:
+            logger.error(f"❌ Unexpected error {evt.get('eventSource')}:{evt.get('eventName')}: {e}")
+
+# =========================
+# Top-level record worker
+# =========================
+def handle_one_top_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    key = idempotency_key(record)
+    try:
+        s3_recs = s3_records_from_any(record)
+        if not s3_recs:
+            return {"ok": True}
+
+        for s3_rec in s3_recs:
+            process_s3_record(s3_rec)
+
+        return {"ok": True}
+    except Exception as e:
+        reason = f"{type(e).__name__}: {str(e)[:500]}"
+        logger.error(f"[{key}] FAIL | {reason}")
+        return {"ok": False, "reason": reason}
+
+# =========================
+# Lambda entrypoint
+# =========================
+def lambda_handler(event, context):
+    records = event.get("Records", []) or []
+    if not records:
+        return {"batchItemFailures": []}
+
+    is_sqs = records[0].get("eventSource") == "aws:sqs"
+    failures: List[Dict[str, str]] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(handle_one_top_record, r): r for r in records}
+        for fut in concurrent.futures.as_completed(futs):
+            r = futs[fut]
+            try:
+                res = fut.result()
+                if is_sqs and not res.get("ok", False):
+                    failures.append({"itemIdentifier": r.get("messageId", "")})
+            except Exception:
+                if is_sqs:
+                    failures.append({"itemIdentifier": r.get("messageId", "")})
+
+    return {"batchItemFailures": failures}
